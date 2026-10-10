@@ -1058,7 +1058,7 @@ fn wait_at_checkpoint_test_barrier(trace_id: &str) -> Result<(), GitAiError> {
     )))
 }
 
-fn apply_checkpoint_side_effect(mut request: CheckpointRequest) -> Result<(), GitAiError> {
+pub fn apply_checkpoint_side_effect(mut request: CheckpointRequest) -> Result<(), GitAiError> {
     #[cfg(feature = "test-support")]
     {
         wait_at_checkpoint_test_barrier(&request.trace_id)?;
