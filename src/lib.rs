@@ -1,3 +1,4 @@
+pub mod agent_git_seam;
 pub mod api;
 pub mod auth;
 pub mod authorship;
