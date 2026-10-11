@@ -102,6 +102,31 @@ pub fn reset_timeout_overrides_for_test() {
     TEST_HOOK_TIMEOUT_MS.with(|c| c.set(None));
 }
 
+// ---------------------------------------------------------------------------
+// Embedded (in-process) bash session store
+// ---------------------------------------------------------------------------
+
+/// When set, bash pre-snapshots live in this process instead of the git-ai
+/// daemon. For hosts that embed git-ai as a library in one long-lived process
+/// and never run the daemon (Enkidu's Agent Git): the pre and post hooks of a
+/// tool call are both handled by that process, so it can hold the snapshot.
+static EMBEDDED_BASH_SESSIONS: std::sync::OnceLock<
+    std::sync::Mutex<crate::daemon::bash_sessions::BashSessionState>,
+> = std::sync::OnceLock::new();
+
+/// Keep bash pre-snapshots in-process for the rest of this process's life.
+/// Idempotent.
+pub fn enable_embedded_bash_sessions() {
+    EMBEDDED_BASH_SESSIONS.get_or_init(Default::default);
+}
+
+fn embedded_bash_sessions()
+-> Option<std::sync::MutexGuard<'static, crate::daemon::bash_sessions::BashSessionState>> {
+    EMBEDDED_BASH_SESSIONS
+        .get()
+        .map(|m| m.lock().unwrap_or_else(|poisoned| poisoned.into_inner()))
+}
+
 /// Resolve the daemon control socket path, preferring the thread-local test
 /// override over the env-based `DaemonConfig`.
 fn effective_daemon_socket() -> Option<std::path::PathBuf> {
@@ -884,6 +909,9 @@ fn query_daemon_watermarks(repo_working_dir: &str) -> Option<DaemonWatermarks> {
 /// Returns `None` if the daemon is not running, the session is not found,
 /// or any communication error occurs.
 fn query_daemon_bash_snapshot(session_id: &str, tool_use_id: &str) -> Option<StatSnapshot> {
+    if let Some(sessions) = embedded_bash_sessions() {
+        return sessions.get_snapshot(session_id, tool_use_id).cloned();
+    }
     let socket = effective_daemon_socket()?;
     if !socket.exists() {
         return None;
@@ -1005,6 +1033,10 @@ struct BashSessionEndSignal<'a> {
 
 /// Signal the daemon that a bash session has ended.
 fn signal_daemon_bash_session_end(signal: BashSessionEndSignal<'_>) {
+    if let Some(mut sessions) = embedded_bash_sessions() {
+        sessions.end_session(signal.session_id, signal.tool_use_id);
+        return;
+    }
     let Some(socket) = effective_daemon_socket() else {
         return;
     };
@@ -1094,6 +1126,21 @@ pub fn handle_bash_pre_tool_use_with_context_and_cwd(
     } else {
         snap.entries.keys().map(|rel| repo_root.join(rel)).collect()
     };
+
+    if let Some(mut sessions) = embedded_bash_sessions() {
+        sessions.start_session(crate::daemon::bash_sessions::BashSessionStart {
+            session_id: context.session_id.to_string(),
+            tool_use_id: context.tool_use_id.to_string(),
+            repo_work_dir: repo_working_dir,
+            agent_id: context.agent_id.clone(),
+            metadata: context.agent_metadata.cloned().unwrap_or_default(),
+            stat_snapshot: snap,
+            start_trace_id: context.trace_id.to_string(),
+            started_at_ns,
+            command: context.command.map(ToString::to_string),
+        });
+        return Ok(BashPreHookResult { dirty_paths });
+    }
 
     let socket = effective_daemon_socket().ok_or_else(|| {
         GitAiError::Generic("no daemon socket available for BashSessionStart".into())
