@@ -311,6 +311,57 @@ fn ensure_daemon(dry_run: bool) {
     }
 }
 
+/// `git-ai enkidu setup`: what Enkidu's Agent Git needs and nothing more.
+/// Points git's trace2 events at the background service in the global git
+/// config, so the service sees every commit, amend, rebase and merge, and
+/// (re)starts the service. Unlike `install-hooks` it touches no agent or
+/// editor configuration: Enkidu wires agent hooks per pane.
+pub fn enkidu_setup() -> Result<(), GitAiError> {
+    configure_daemon_trace2(false)?;
+    ensure_daemon(false);
+    Ok(())
+}
+
+/// `git-ai enkidu teardown`: undo [`enkidu_setup`]. Removes the global trace2
+/// keys only while they still point at this service (a user who changed
+/// them keeps theirs), then shuts the service down.
+pub fn enkidu_teardown() -> Result<(), GitAiError> {
+    let runtime_config = config::Config::fresh();
+    let ours = DaemonConfig::from_env_or_default_paths()?.trace2_event_target();
+    if global_git_config_value(runtime_config.git_cmd(), TRACE2_EVENT_TARGET_KEY).as_deref()
+        == Some(ours.as_str())
+    {
+        remove_global_git_config_section(runtime_config.git_cmd(), "trace2")?;
+    }
+    if let Ok(daemon_config) = DaemonConfig::from_env_or_default_paths() {
+        let _ = crate::commands::daemon::stop_daemon_for_enkidu(&daemon_config);
+    }
+    Ok(())
+}
+
+/// Whether the global trace2 target points at this service.
+pub fn enkidu_trace2_configured() -> bool {
+    let runtime_config = config::Config::fresh();
+    let Ok(daemon_config) = DaemonConfig::from_env_or_default_paths() else {
+        return false;
+    };
+    global_git_config_value(runtime_config.git_cmd(), TRACE2_EVENT_TARGET_KEY).as_deref()
+        == Some(daemon_config.trace2_event_target().as_str())
+}
+
+fn global_git_config_value(git_cmd: &str, key: &str) -> Option<String> {
+    let mut command = Command::new(git_cmd);
+    command
+        .args(["config", "--global", "--get", key])
+        .stderr(Stdio::null());
+    crate::git::repository::apply_internal_git_env(&mut command);
+    let output = command.output().ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 /// Main entry point for install-hooks command
 pub fn run(args: &[String]) -> Result<HashMap<String, String>, GitAiError> {
     let options = parse_install_options(args)?;

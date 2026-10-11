@@ -630,6 +630,15 @@ fn handle_shutdown(args: &[String]) -> Result<(), String> {
     }
 }
 
+/// Stop the background service gracefully if it is running (Enkidu's Agent
+/// Git turning off).
+pub(crate) fn stop_daemon_for_enkidu(config: &DaemonConfig) -> Result<(), String> {
+    if !daemon_is_up(config) && !daemon_startup_is_blocked(config) {
+        return Ok(());
+    }
+    stop_daemon(config, GRACEFUL_SHUTDOWN_TIMEOUT)
+}
+
 fn handle_restart(args: &[String]) -> Result<(), String> {
     let config = daemon_config_from_env_or_default_paths()?;
     let hard = has_flag(args, "--hard");

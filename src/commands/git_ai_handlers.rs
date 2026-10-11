@@ -48,6 +48,7 @@ pub fn handle_git_ai(args: &[String]) {
             | "d"
             | "daemon"
             | "debug"
+            | "enkidu"
             | "install-hooks"
             | "install"
             | "uninstall"
@@ -177,6 +178,7 @@ pub fn handle_git_ai(args: &[String]) {
         "git-hooks" => {
             handle_git_hooks(&args[1..]);
         }
+        "enkidu" => handle_enkidu(&args[1..]),
         "await" => {
             commands::r#await::handle_await(&args[1..]);
         }
@@ -203,6 +205,31 @@ pub fn handle_git_ai(args: &[String]) {
             std::process::exit(1);
         }
     }
+}
+
+/// `git-ai enkidu setup|teardown|status`: the narrow setup Enkidu's Agent Git
+/// tool runs when it turns on and off. Prints one JSON object.
+fn handle_enkidu(args: &[String]) {
+    let result = match args.first().map(String::as_str) {
+        Some("setup") => commands::install_hooks::enkidu_setup(),
+        Some("teardown") => commands::install_hooks::enkidu_teardown(),
+        Some("status") => Ok(()),
+        _ => {
+            eprintln!("Usage: git-ai enkidu setup|teardown|status");
+            std::process::exit(1);
+        }
+    };
+    if let Err(error) = result {
+        eprintln!("git-ai enkidu: {error}");
+        std::process::exit(1);
+    }
+    println!(
+        "{}",
+        serde_json::json!({
+            "trace2": commands::install_hooks::enkidu_trace2_configured(),
+            "version": env!("CARGO_PKG_VERSION"),
+        })
+    );
 }
 
 fn print_help() {
