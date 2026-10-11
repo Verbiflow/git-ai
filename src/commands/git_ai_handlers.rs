@@ -33,7 +33,7 @@ pub fn handle_git_ai(args: &[String]) {
     // per-PID log files.
     //
     // Skip for commands that must work without a running background service
-    // (help, version, config, d management, debug, upgrade) so users can
+    // (help, version, config, d management, debug) so users can
     // always diagnose and recover from a broken state.
     let needs_daemon = !matches!(
         args[0].as_str(),
@@ -48,31 +48,31 @@ pub fn handle_git_ai(args: &[String]) {
             | "d"
             | "daemon"
             | "debug"
-            | "upgrade"
             | "install-hooks"
             | "install"
             | "uninstall"
             | "uninstall-hooks"
             | "usage"
     );
-    if needs_daemon {
-        use crate::daemon::telemetry_handle::{
-            DaemonTelemetryInitResult, init_daemon_telemetry_handle,
-        };
-        match init_daemon_telemetry_handle() {
-            DaemonTelemetryInitResult::Connected | DaemonTelemetryInitResult::Skipped => {}
-            DaemonTelemetryInitResult::Failed(err) => {
-                eprintln!(
-                    "error: failed to connect to git-ai background service: {}",
-                    err
-                );
-                if args[0].as_str() == "checkpoint" {
-                    std::process::exit(0);
-                }
-                std::process::exit(1);
-            }
+    // Make sure the background service is up (outside the service itself and
+    // outside tests, which point at their own socket).
+    #[cfg(not(any(test, feature = "test-support")))]
+    if needs_daemon
+        && !crate::daemon::daemon_process_active()
+        && let Err(err) =
+            crate::commands::daemon::ensure_daemon_running(std::time::Duration::from_secs(2))
+    {
+        eprintln!(
+            "error: failed to connect to git-ai background service: {}",
+            err
+        );
+        if args[0].as_str() == "checkpoint" {
+            std::process::exit(0);
         }
+        std::process::exit(1);
     }
+    #[cfg(any(test, feature = "test-support"))]
+    let _ = needs_daemon;
 
     // Start DB warmup early for commands that need database access
     if args[0].as_str() == "show-prompt" {
@@ -111,12 +111,6 @@ pub fn handle_git_ai(args: &[String]) {
         }
         "usage" => {
             commands::usage::handle_usage(&args[1..]);
-        }
-        "analyze" => {
-            commands::analyze::handle_analyze(&args[1..]);
-            if is_interactive_terminal() {
-                log_message("analyze", "info", None)
-            }
         }
         "status" => {
             commands::status::handle_status(&args[1..]);
@@ -183,35 +177,8 @@ pub fn handle_git_ai(args: &[String]) {
         "git-hooks" => {
             handle_git_hooks(&args[1..]);
         }
-        "ci" => {
-            commands::ci_handlers::handle_ci(&args[1..]);
-        }
-        "upgrade" => {
-            commands::upgrade::run_with_args(&args[1..]);
-        }
-        "flush-metrics-db" => {
-            commands::flush_metrics_db::handle_flush_metrics_db(&args[1..]);
-        }
-        "reingest" => {
-            commands::reingest::handle_reingest(&args[1..]);
-        }
         "await" => {
             commands::r#await::handle_await(&args[1..]);
-        }
-        "login" => {
-            commands::login::handle_login(&args[1..]);
-        }
-        "logout" => {
-            commands::logout::handle_logout(&args[1..]);
-        }
-        "whoami" => {
-            commands::whoami::handle_whoami(&args[1..]);
-        }
-        "exchange-nonce" => {
-            commands::exchange_nonce::handle_exchange_nonce(&args[1..]);
-        }
-        "dash" | "dashboard" => {
-            commands::personal_dashboard::handle_personal_dashboard(&args[1..]);
         }
         "show-prompt" => {
             commands::show_prompt::handle_show_prompt(&args[1..]);
@@ -231,88 +198,10 @@ pub fn handle_git_ai(args: &[String]) {
         "push-authorship-notes" | "push_authorship_notes" => {
             handle_push_authorship_notes_internal(&args[1..]);
         }
-        "notes" => {
-            handle_notes_subcommand(&args[1..]);
-        }
         _ => {
             println!("Unknown git-ai command: {}", args[0]);
             std::process::exit(1);
         }
-    }
-}
-
-/// Dispatch `git-ai notes <subcommand>` commands.
-pub(crate) fn handle_notes_subcommand(args: &[String]) {
-    let subcommand = args.first().map(|s| s.as_str()).unwrap_or("--help");
-    match subcommand {
-        "migrate" => {
-            commands::notes_migrate::handle_notes_migrate(&args[1..]);
-        }
-        // Hidden: in-memory reference implementation of the notes backend HTTP
-        // contract. Intentionally not advertised in `--help`; it is for
-        // developers, tests, and benchmarks, not end users.
-        "serve" => {
-            handle_notes_serve(&args[1..]);
-        }
-        "--help" | "-h" | "help" => {
-            eprintln!("git ai notes - Notes backend management commands");
-            eprintln!();
-            eprintln!("Usage: git ai notes <subcommand> [options]");
-            eprintln!();
-            eprintln!("Subcommands:");
-            eprintln!("  migrate    Bulk-upload existing git notes to the HTTP backend");
-            eprintln!();
-            eprintln!("Run 'git ai notes <subcommand> --help' for details.");
-        }
-        other => {
-            eprintln!("Unknown git-ai notes subcommand: {}", other);
-            eprintln!("Run 'git ai notes --help' for usage.");
-            std::process::exit(1);
-        }
-    }
-}
-
-/// `git-ai notes serve` — run the in-memory reference notes backend.
-///
-/// This is a developer/test tool. The server stores everything in process
-/// memory and accepts any auth header. See
-/// `crate::notes::reference_server` for the wire contract.
-fn handle_notes_serve(args: &[String]) {
-    let mut bind: String = "127.0.0.1:0".to_string();
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--bind" if i + 1 < args.len() => {
-                bind = args[i + 1].clone();
-                i += 2;
-            }
-            "--port" if i + 1 < args.len() => {
-                bind = format!("127.0.0.1:{}", args[i + 1]);
-                i += 2;
-            }
-            "--help" | "-h" => {
-                eprintln!(
-                    "git ai notes serve - Run the in-memory notes backend reference server\n\
-                     \n\
-                     Usage: git ai notes serve [--bind <addr:port>] [--port <port>]\n\
-                     \n\
-                     This is a reference implementation. All notes are stored in process\n\
-                     memory; auth headers are accepted but not validated. It exists to\n\
-                     document the HTTP wire contract and to enable local testing of the\n\
-                     `notes_backend.kind = http` code path without a real backend."
-                );
-                return;
-            }
-            other => {
-                eprintln!("Unknown argument to `git ai notes serve`: {}", other);
-                std::process::exit(1);
-            }
-        }
-    }
-
-    if let Err(e) = crate::notes::reference_server::run_blocking(&bind) {
-        eprintln!("notes reference server failed: {}", e);
-        std::process::exit(1);
     }
 }
 
@@ -350,7 +239,6 @@ fn print_help() {
     eprintln!("  usage              Show local AI usage statistics");
     eprintln!("    --period <1d|3d|7d|30d>  Time window (default: 30d)");
     eprintln!("    --json                 Output in JSON format");
-    eprintln!("  analyze [beta]      Analyze agent sessions and effectiveness");
     eprintln!("  status             Show uncommitted AI authorship status (debug)");
     eprintln!("    --json                 Output in JSON format");
     eprintln!(
@@ -382,23 +270,12 @@ fn print_help() {
     eprintln!("                           Also install the Visual Studio extension on Windows");
     eprintln!("  uninstall, uninstall-hooks");
     eprintln!("                       Remove git-ai hooks from all detected tools");
-    eprintln!("  ci                 Continuous integration utilities");
-    eprintln!("    github                 GitHub CI helpers");
     eprintln!("  git-path           Print the path to the underlying git executable");
     eprintln!("  await [beta]       Wait for the background service to finish all work");
     eprintln!("    --timeout <seconds>    Maximum time to wait (default: 30)");
-    eprintln!("  reingest           Redeliver locally stored metric events");
-    eprintln!("    --all                  Reingest all retained events");
-    eprintln!("    --from <time> --to <time>  Reingest an RFC3339 [from, to) range");
-    eprintln!("    --since <duration>      Reingest a recent s/m/h/d/w duration");
-    eprintln!("  upgrade            Check for updates and install if available");
-    eprintln!("    --force               Reinstall latest version even if already up to date");
     eprintln!("  fetch-notes [remote] Synchronously fetch AI authorship notes");
     eprintln!("    --remote <name>       Explicit remote name (default: upstream or origin)");
     eprintln!("    --json                Output result as JSON");
-    eprintln!("  login              Authenticate with Git AI");
-    eprintln!("  logout             Clear stored credentials");
-    eprintln!("  whoami             Show auth state and login identity");
     eprintln!("  version, -v, --version     Print the git-ai version");
     eprintln!("  help, -h, --help           Show this help message");
     eprintln!();

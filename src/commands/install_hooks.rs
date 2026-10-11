@@ -327,23 +327,9 @@ pub fn run(args: &[String]) -> Result<HashMap<String, String>, GitAiError> {
     }
 
     if options.configure_wsl {
-        let api_base = options.api_base.clone().or_else(|| {
-            std::env::var("API_BASE")
-                .ok()
-                .filter(|value| !value.is_empty())
-        });
-        let api_key = options.api_key.clone().or_else(|| {
-            std::env::var("API_KEY")
-                .ok()
-                .filter(|value| !value.is_empty())
-        });
-        crate::commands::install_wsl::install(
-            crate::commands::install_wsl::InstallConfig {
-                api_base: api_base.as_deref(),
-                api_key: api_key.as_deref(),
-            },
-            options.dry_run,
-        );
+        // Upstream piped git-ai's install script from usegitai.com into each
+        // WSL distro; this fork downloads nothing.
+        eprintln!("--wsl is not supported in this build; nothing installed in WSL.");
     }
 
     result
@@ -369,12 +355,6 @@ fn run_hooks_install(options: &InstallOptions) -> Result<HashMap<String, String>
         eprintln!("Warning: could not configure trace2 (non-fatal): {e}");
     }
     ensure_daemon(options.dry_run);
-
-    // Now that the daemon is (re)started, initialize the telemetry handle so
-    // that install-hooks metrics and observability events route through it.
-    if !options.dry_run {
-        let _ = crate::daemon::telemetry_handle::init_daemon_telemetry_handle();
-    }
 
     // Get absolute path to the current binary
     let binary_path = get_current_binary_path()?;

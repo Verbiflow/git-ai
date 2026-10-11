@@ -25,30 +25,16 @@
 //! omit their long-context tiers, so both are hand-tracked in override
 //! tables below, applied when a catalog is loaded.
 
-use crate::utils::{read_json_file, unix_timestamp_now, write_json_file};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
 const EMBEDDED_SNAPSHOT: &str = include_str!("models_dev_pricing_snapshot.json");
-const MODELS_DEV_API_URL: &str = "https://models.dev/api.json";
-const CACHE_FILE_NAME: &str = "models_dev_pricing.json";
-/// Format version of the on-disk cache. Bump whenever `ModelPricing`'s
-/// serialized shape changes meaning: caches written under another format are
-/// ignored (the embedded snapshot applies) until a refresh rewrites them,
-/// never reinterpreted — a pre-tier cache stored explicit 0.0 for unpublished
-/// cache rates, which the optional-rate schema would read as published-free
-/// pricing, and it carries no tiers or fast multipliers.
-const PRICING_CACHE_VERSION: u32 = 2;
-/// Minimum interval between refresh *attempts* (successful or not), so
-/// offline machines don't stall on the fetch timeout at every invocation.
-const REFRESH_INTERVAL_SECS: u64 = 24 * 3600;
-const FETCH_TIMEOUT_SECS: u64 = 5;
 
 /// Providers whose models are kept when trimming the full models.dev catalog.
 /// Restricted to first-party providers so aggregator/reseller listings can't
 /// shadow canonical model ids with different prices.
+#[cfg(test)]
 const PROVIDER_ALLOWLIST: [&str; 8] = [
     "anthropic",
     "openai",
@@ -325,25 +311,14 @@ pub fn pricing_for(model: &str) -> Option<ModelPricing> {
     result
 }
 
-/// True when the process must not touch the user-level pricing cache: unit
-/// tests run in-process (cfg!(test)) and integration-test subprocesses carry
-/// the codebase-wide GIT_AI_TEST_DB_PATH marker. Both always use the embedded
-/// snapshot so results don't depend on developer-machine state.
-fn use_embedded_only() -> bool {
-    cfg!(test) || std::env::var_os("GIT_AI_TEST_DB_PATH").is_some()
-}
-
 fn catalog() -> &'static PricingCatalog {
     &catalog_with_id().0
 }
 
 /// Identity of the catalog in effect, stored per priced entry so emitted
 /// costs stay attributable to the rates that produced them: the running
-/// binary's version for the embedded snapshot, a content hash for a fetched
-/// cache (the cache file carries no version of its own). The hash covers the
-/// fetched data only — the hand-tracked override tables applied at load time
-/// are compile-time constants, so the effective rates are pinned by this id
-/// *together with* the `git_ai_version` attribute every event carries.
+/// binary's version, since this fork prices from the embedded snapshot only
+/// (upstream also fetched a fresh catalog from models.dev).
 pub fn pricing_catalog_id() -> &'static str {
     &catalog_with_id().1
 }
@@ -351,14 +326,6 @@ pub fn pricing_catalog_id() -> &'static str {
 fn catalog_with_id() -> &'static (PricingCatalog, String) {
     static CATALOG: OnceLock<(PricingCatalog, String)> = OnceLock::new();
     CATALOG.get_or_init(|| {
-        if !use_embedded_only()
-            && let Some(cache) = cache_path().and_then(|path| read_json_file::<PricingCache>(&path))
-            && cache.is_current_format()
-            && !cache.models.is_empty()
-        {
-            let id = format!("modelsdev:{}", catalog_hash(&cache.models));
-            return (PricingCatalog::from_entries(cache.models), id);
-        }
         (
             embedded_catalog(),
             format!(
@@ -369,102 +336,9 @@ fn catalog_with_id() -> &'static (PricingCatalog, String) {
     })
 }
 
-/// Short content hash of a fetched catalog (12 hex chars of SHA-256 over its
-/// canonical JSON — BTreeMap keys serialize in stable order).
-fn catalog_hash(models: &BTreeMap<String, ModelPricing>) -> String {
-    use sha2::{Digest, Sha256};
-    let json = serde_json::to_string(models).unwrap_or_default();
-    format!("{:x}", Sha256::digest(json.as_bytes()))[..12].to_string()
-}
-
 fn embedded_catalog() -> PricingCatalog {
     PricingCatalog::from_snapshot_json(EMBEDDED_SNAPSHOT)
         .expect("embedded models.dev pricing snapshot must parse")
-}
-
-/// On-disk cache: the trimmed catalog plus the timestamp of the last refresh
-/// attempt (used for throttling, so failed attempts are also spaced out).
-#[derive(Serialize, Deserialize)]
-struct PricingCache {
-    /// See [`PRICING_CACHE_VERSION`]; pre-version files default to 0.
-    #[serde(default)]
-    version: u32,
-    last_attempt_at: u64,
-    models: BTreeMap<String, ModelPricing>,
-}
-
-impl PricingCache {
-    fn is_current_format(&self) -> bool {
-        self.version == PRICING_CACHE_VERSION
-    }
-}
-
-fn cache_path() -> Option<PathBuf> {
-    crate::config::internal_dir_path().map(|dir| dir.join(CACHE_FILE_NAME))
-}
-
-/// Best-effort refresh of the on-disk pricing cache from models.dev, called
-/// by `git-ai usage` before stats are computed (i.e. before the global
-/// catalog is first read). Skipped in tests and when the last attempt was
-/// less than a day ago.
-pub fn refresh_cache_if_stale() {
-    if use_embedded_only() {
-        return;
-    }
-    let Some(path) = cache_path() else {
-        return;
-    };
-    let now = unix_timestamp_now();
-    let existing: Option<PricingCache> = read_json_file(&path);
-    if let Some(cache) = &existing
-        && is_fresh(cache.last_attempt_at, now)
-    {
-        return;
-    }
-    write_json_file(&path, &next_cache(existing, fetch_and_trim_catalog(), now));
-}
-
-/// A refresh attempt at `last_attempt_at` is still fresh at `now` when it
-/// lies within the past refresh interval. Future timestamps (clock skew, a
-/// since-corrected clock) count as stale so a bogus timestamp can't block
-/// refreshes indefinitely.
-fn is_fresh(last_attempt_at: u64, now: u64) -> bool {
-    last_attempt_at <= now && now - last_attempt_at < REFRESH_INTERVAL_SECS
-}
-
-/// Fold a fetch result into the next cache state. On failure the previously
-/// fetched models are kept — unless they were written under another format,
-/// which must not be relabeled as current — but the embedded snapshot is
-/// never copied into the cache: an empty cache keeps falling through to the
-/// (possibly newer) snapshot shipped with the running binary, while the
-/// bumped attempt timestamp still throttles the next fetch.
-fn next_cache(
-    existing: Option<PricingCache>,
-    fetched: Result<BTreeMap<String, ModelPricing>, String>,
-    now: u64,
-) -> PricingCache {
-    let models = match fetched {
-        Ok(models) => models,
-        Err(_) => existing
-            .filter(PricingCache::is_current_format)
-            .map(|cache| cache.models)
-            .unwrap_or_default(),
-    };
-    PricingCache {
-        version: PRICING_CACHE_VERSION,
-        last_attempt_at: now,
-        models,
-    }
-}
-
-fn fetch_and_trim_catalog() -> Result<BTreeMap<String, ModelPricing>, String> {
-    let agent = crate::http::build_agent(Some(FETCH_TIMEOUT_SECS));
-    let response = crate::http::send(agent.get(MODELS_DEV_API_URL))?;
-    if response.status_code != 200 {
-        return Err(format!("HTTP {}", response.status_code));
-    }
-    let body = response.as_str().map_err(|e| e.to_string())?;
-    trim_catalog(body)
 }
 
 /// A model's `cost` object as models.dev publishes it. Unlike [`ModelPricing`]
@@ -472,6 +346,7 @@ fn fetch_and_trim_catalog() -> Result<BTreeMap<String, ModelPricing>, String> {
 /// are held as raw JSON and parsed per band, so one novel-shaped band (or a
 /// non-array `tiers`) degrades that model to its flat rates instead of
 /// silently dropping it from the catalog.
+#[cfg(test)]
 #[derive(Deserialize)]
 struct ModelsDevCost {
     input: Option<f64>,
@@ -482,6 +357,7 @@ struct ModelsDevCost {
     tiers: serde_json::Value,
 }
 
+#[cfg(test)]
 #[derive(Deserialize)]
 struct ModelsDevTier {
     input: Option<f64>,
@@ -491,6 +367,7 @@ struct ModelsDevTier {
     tier: Option<ModelsDevTierBound>,
 }
 
+#[cfg(test)]
 #[derive(Deserialize)]
 struct ModelsDevTierBound {
     #[serde(rename = "type")]
@@ -498,6 +375,7 @@ struct ModelsDevTierBound {
     size: Option<u64>,
 }
 
+#[cfg(test)]
 impl ModelsDevCost {
     /// The model's long-context band: the `context`-bound tier with the
     /// lowest threshold. [`ModelPricing`] holds one above-base band, so the
@@ -575,6 +453,7 @@ fn fast_multiplier_override(model_id: &str) -> f64 {
 /// Pure models.dev data — the hand-tracked override tables are applied at
 /// load time by [`apply_overrides`]. Models without a parseable cost entry
 /// (missing, or lacking input/output rates) are skipped.
+#[cfg(test)]
 fn trim_catalog(api_json: &str) -> Result<BTreeMap<String, ModelPricing>, String> {
     let providers: serde_json::Value = serde_json::from_str(api_json).map_err(|e| e.to_string())?;
     let mut entries = BTreeMap::new();
@@ -1076,111 +955,4 @@ mod tests {
         assert!(trim_catalog(r#"{"anthropic": {"models": {}}}"#).is_err());
     }
 
-    fn fetched_models() -> BTreeMap<String, ModelPricing> {
-        let mut models = BTreeMap::new();
-        models.insert(
-            "claude-test-1".to_string(),
-            ModelPricing {
-                input: 10.0,
-                output: 50.0,
-                cache_read: Some(1.0),
-                cache_write: Some(12.5),
-                ..Default::default()
-            },
-        );
-        models
-    }
-
-    #[test]
-    fn refresh_failure_never_copies_embedded_data_into_the_cache() {
-        // First-ever attempt fails: the cache records the attempt but stays
-        // empty, so catalog() keeps using the running binary's snapshot.
-        let cache = next_cache(None, Err("offline".to_string()), 100);
-        assert_eq!(cache.last_attempt_at, 100);
-        assert!(cache.models.is_empty());
-
-        // A later failure keeps previously *fetched* models.
-        let existing = PricingCache {
-            version: PRICING_CACHE_VERSION,
-            last_attempt_at: 100,
-            models: fetched_models(),
-        };
-        let cache = next_cache(Some(existing), Err("offline".to_string()), 200);
-        assert_eq!(cache.last_attempt_at, 200);
-        assert_eq!(cache.models, fetched_models());
-
-        // Success replaces the models outright.
-        let existing = PricingCache {
-            version: PRICING_CACHE_VERSION,
-            last_attempt_at: 200,
-            models: BTreeMap::new(),
-        };
-        let cache = next_cache(Some(existing), Ok(fetched_models()), 300);
-        assert_eq!(cache.last_attempt_at, 300);
-        assert_eq!(cache.models, fetched_models());
-    }
-
-    #[test]
-    fn other_format_cache_files_are_ignored_not_reinterpreted() {
-        // A cache written before cache rates became optional stores explicit
-        // 0.0 for unpublished rates, which the optional-rate schema would
-        // read as published-free pricing (and it carries no tiers or fast
-        // multipliers). Such files must be discarded — the embedded snapshot
-        // applies — never reinterpreted.
-        let old: PricingCache = serde_json::from_str(
-            r#"{"last_attempt_at":100,"models":{"gpt-5-pro":{"input":15.0,"output":120.0,"cache_read":0.0,"cache_write":0.0}}}"#,
-        )
-        .unwrap();
-        assert!(!old.is_current_format(), "pre-version files default to 0");
-        // A failed refresh drops the other-format models rather than
-        // relabeling them as current.
-        let next = next_cache(Some(old), Err("offline".to_string()), 200);
-        assert!(next.models.is_empty());
-        assert_eq!(next.version, PRICING_CACHE_VERSION);
-    }
-
-    #[test]
-    fn staleness_treats_future_timestamps_as_stale() {
-        let now = 1_000_000_000;
-        assert!(is_fresh(now, now));
-        assert!(is_fresh(now - REFRESH_INTERVAL_SECS + 1, now));
-        assert!(!is_fresh(now - REFRESH_INTERVAL_SECS, now));
-        // A clock that was skewed ahead when the cache was written must not
-        // block refreshes after it is corrected.
-        assert!(!is_fresh(now + 1, now));
-        assert!(!is_fresh(u64::MAX, now));
-    }
-
-    #[test]
-    fn cache_round_trips_through_disk() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(CACHE_FILE_NAME);
-        write_json_file(
-            &path,
-            &PricingCache {
-                version: PRICING_CACHE_VERSION,
-                last_attempt_at: 1234567890,
-                models: fetched_models(),
-            },
-        );
-
-        let cache: PricingCache = read_json_file(&path).unwrap();
-        assert!(cache.is_current_format());
-        assert_eq!(cache.last_attempt_at, 1234567890);
-        assert_eq!(cache.models, fetched_models());
-    }
-
-    /// Regenerates the embedded snapshot from the live models.dev catalog.
-    /// Run manually when new models ship or prices change:
-    /// `cargo test regenerate_models_dev_pricing_snapshot -- --ignored`
-    #[test]
-    #[ignore]
-    fn regenerate_models_dev_pricing_snapshot() {
-        let entries = fetch_and_trim_catalog().expect("fetching models.dev catalog must succeed");
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("src/metrics/models_dev_pricing_snapshot.json");
-        let mut json = serde_json::to_string_pretty(&entries).expect("snapshot must serialize");
-        json.push('\n');
-        std::fs::write(&path, json).expect("snapshot file must be writable");
-    }
 }

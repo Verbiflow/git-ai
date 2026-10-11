@@ -1,7 +1,7 @@
 //! Metrics tracking module.
 //!
 //! This module provides functionality for recording metric events.
-//! Events are routed through the daemon telemetry worker.
+//! Events are built and dropped: this fork sends no metrics anywhere.
 //!
 //! All public types are re-exported for external use (e.g., ingestion server).
 
@@ -24,8 +24,8 @@ pub use types::{EventValues, METRICS_API_VERSION, MetricEvent, MetricsBatch};
 
 /// Record an event with values and attributes.
 ///
-/// Events are sent to the daemon telemetry worker which batches
-/// and uploads them to the API.
+/// This fork records and sends nothing; the call is kept so call sites
+/// stay as upstream wrote them.
 ///
 /// # Example
 ///
@@ -54,9 +54,8 @@ pub fn record<V: EventValues>(values: V, attrs: EventAttributes) {
     if should_ignore_debug_self_check_event(&attrs) {
         return;
     }
-    let event = MetricEvent::new(&values, attrs.to_sparse());
-    // Write directly to observability log
-    crate::observability::log_metrics(vec![event]);
+    // Built and dropped: this fork records and sends no metrics.
+    let _ = MetricEvent::new(&values, attrs.to_sparse());
 }
 
 fn should_ignore_debug_self_check_event(attrs: &EventAttributes) -> bool {

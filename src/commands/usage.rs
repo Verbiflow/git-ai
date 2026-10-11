@@ -76,10 +76,6 @@ pub fn handle_usage(args: &[String]) {
         }
     };
 
-    // Best-effort refresh of the models.dev pricing cache (at most daily)
-    // before stats — and therefore cost estimates — are computed.
-    crate::metrics::model_pricing::refresh_cache_if_stale();
-
     let since_ts = days_ago(days);
 
     // Fetch events once and derive both views from the same snapshot so the

@@ -63,7 +63,6 @@ pub mod bash_sessions;
 pub mod checkpoint;
 pub mod control_api;
 pub mod coordinator;
-pub mod daemon_log_layer;
 pub mod domain;
 pub mod family_actor;
 pub mod git_backend;
@@ -74,11 +73,9 @@ pub mod reducer;
 pub mod ref_cursor;
 pub mod repo_family_store;
 pub mod rewrite_metrics;
-pub mod sentry_layer;
+pub mod local_metrics;
 pub mod stream_worker;
 pub mod sweep_coordinator;
-pub mod telemetry_handle;
-pub mod telemetry_worker;
 pub mod test_sync;
 pub mod token_usage_worker;
 pub mod trace_normalizer;
@@ -88,7 +85,7 @@ pub mod untraced_fixup_ignore;
 
 pub use control_api::{
     BashSessionQueryResponse, BashSnapshotQueryResponse, ControlRequest, ControlResponse,
-    FamilyStatus, TelemetryEnvelope,
+    FamilyStatus,
 };
 
 const PID_META_FILE: &str = "daemon.pid.json";
@@ -1320,14 +1317,8 @@ fn apply_push_side_effect(
     command: Option<&str>,
     args: &[String],
 ) -> Result<(), GitAiError> {
-    use crate::config::NotesBackendKind;
     use crate::git::cli_parser::is_dry_run;
     use crate::git::sync_authorship::{push_authorship_notes, push_remote_from_args};
-
-    if crate::config::Config::get().notes_backend_kind() == NotesBackendKind::Http {
-        tracing::debug!("apply_push_side_effect: skipping authorship push (Http backend)");
-        return Ok(());
-    }
 
     let repo = find_repository_in_path(worktree)?;
     let parsed = parsed_invocation_for_side_effect(command, args);
@@ -1344,7 +1335,6 @@ fn apply_push_side_effect(
 
     let remote = push_remote_from_args(&repo, &parsed)?;
 
-    crate::commands::upgrade::maybe_schedule_background_update_check();
     tracing::debug!("started pushing authorship notes to remote: {}", remote);
 
     push_authorship_notes(&repo, &remote)
@@ -1382,47 +1372,31 @@ fn apply_pull_notes_sync_side_effect(
     command: Option<&str>,
     args: &[String],
 ) -> Result<(), GitAiError> {
-    use crate::config::NotesBackendKind;
-
     let repo = find_repository_in_path(worktree)?;
     let parsed = parsed_invocation_for_side_effect(command, args);
     let remote = fetch_remote_from_args(&repo, &parsed)?;
-    let notes_backend = crate::config::Config::fresh().notes_backend_kind();
 
     tracing::info!(
         command = command.unwrap_or("pull"),
         remote = %remote,
-        backend = %notes_backend,
         worktree = %worktree,
         "handling pull notes sync"
     );
-
-    if notes_backend == NotesBackendKind::Http {
-        return crate::git::notes_api::warm_cache_for_remote(&repo, &remote);
-    }
 
     fetch_authorship_notes(&repo, &remote)?;
     Ok(())
 }
 
 fn apply_clone_notes_sync_side_effect(worktree: &str) -> Result<(), GitAiError> {
-    use crate::config::NotesBackendKind;
-
     let repo = find_repository_in_path(worktree)?;
     let remote = "origin";
-    let notes_backend = crate::config::Config::fresh().notes_backend_kind();
 
     tracing::info!(
         command = "clone",
         remote = %remote,
-        backend = %notes_backend,
         worktree = %worktree,
         "handling clone notes sync"
     );
-
-    if notes_backend == NotesBackendKind::Http {
-        return crate::git::notes_api::warm_cache_for_remote(&repo, remote);
-    }
 
     fetch_authorship_notes(&repo, remote)?;
     Ok(())
@@ -3112,7 +3086,6 @@ pub struct ActorDaemonCoordinator {
     // OnceLock: set once at worker start, never cleared. The ingest worker
     // exits via the shutdown select! arm instead of relying on channel closure.
     trace_ingest_tx: std::sync::OnceLock<mpsc::Sender<Value>>,
-    telemetry_worker: Option<crate::daemon::telemetry_worker::DaemonTelemetryWorkerHandle>,
     /// Families and fixup cursors remembered across restarts; `None` when the
     /// database could not be opened (fixup then only covers this process).
     repo_family_store: Option<Arc<crate::daemon::repo_family_store::RepoFamilyStore>>,
@@ -3178,14 +3151,6 @@ pub struct ActorDaemonCoordinator {
 pub(crate) enum DaemonExitAction {
     Stop,
     Restart,
-    RestartAfterUpdate,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum DaemonSelfUpdateOutcome {
-    Installed,
-    NoUpdate,
-    Failed,
 }
 
 impl DaemonExitAction {
@@ -3193,14 +3158,12 @@ impl DaemonExitAction {
         match self {
             Self::Stop => 0,
             Self::Restart => 1,
-            Self::RestartAfterUpdate => 2,
         }
     }
 
     fn from_u8(value: u8) -> Self {
         match value {
             1 => Self::Restart,
-            2 => Self::RestartAfterUpdate,
             _ => Self::Stop,
         }
     }
@@ -3278,7 +3241,6 @@ impl ActorDaemonCoordinator {
                 }),
             test_completion_log_lock: Mutex::new(()),
             trace_ingest_tx: std::sync::OnceLock::new(),
-            telemetry_worker: None,
             repo_family_store: None,
             untraced_persistence_blocked: Mutex::new(HashSet::new()),
             untraced_fixup_ignore: Mutex::new(Default::default()),
@@ -3627,14 +3589,6 @@ impl ActorDaemonCoordinator {
     fn request_restart(&self) {
         self.shutdown_action
             .store(DaemonExitAction::Restart.as_u8(), Ordering::SeqCst);
-        self.request_shutdown();
-    }
-
-    fn request_restart_after_update(&self) {
-        self.shutdown_action.store(
-            DaemonExitAction::RestartAfterUpdate.as_u8(),
-            Ordering::SeqCst,
-        );
         self.request_shutdown();
     }
 
@@ -8496,31 +8450,6 @@ impl ActorDaemonCoordinator {
             }
         }
 
-        // Phase 3: flush telemetry and wait for the worker to finish.
-        if !result.timed_out
-            && let Some(worker) = &self.telemetry_worker
-        {
-            let now = Instant::now();
-            if now < deadline {
-                let remaining = deadline - now;
-                maybe_log("telemetry flush");
-                match timeout(remaining, worker.flush_and_wait()).await {
-                    Ok(Ok(status)) => {
-                        result.metrics_remaining = status.metrics_remaining;
-                        result.notes_remaining = status.notes_remaining;
-                    }
-                    Ok(Err(e)) => {
-                        tracing::warn!(error = %e, "await: telemetry flush failed");
-                    }
-                    Err(_) => {
-                        result.timed_out = true;
-                    }
-                }
-            } else {
-                result.timed_out = true;
-            }
-        }
-
         result.done = !result.timed_out
             && result.metrics_remaining == 0
             && result.notes_remaining == 0
@@ -8611,44 +8540,6 @@ impl ActorDaemonCoordinator {
                     .map(|v| ControlResponse::ok(None, Some(v)))
                     .map_err(GitAiError::from)
                 }),
-            ControlRequest::SubmitTelemetry { envelopes } => {
-                if let Some(worker) = &self.telemetry_worker {
-                    worker.submit_telemetry(envelopes).await;
-                }
-                Ok(ControlResponse::ok(None, None))
-            }
-            ControlRequest::SubmitCas { records } => {
-                if let Some(worker) = &self.telemetry_worker {
-                    worker.submit_cas(records).await;
-                }
-                Ok(ControlResponse::ok(None, None))
-            }
-            ControlRequest::FlushNotes => {
-                // Fire-and-forget trigger routed through the serialized flush
-                // loop (the periodic loop is the safety net); see
-                // `request_flush` for why a bare concurrent `flush_notes`
-                // here would let `await` certify mid-upload.
-                if let Some(worker) = &self.telemetry_worker {
-                    worker.request_flush();
-                }
-                Ok(ControlResponse::ok(None, None))
-            }
-            ControlRequest::ReingestMetrics { from_ts, to_ts } => {
-                if let Some(worker) = &self.telemetry_worker {
-                    worker
-                        .reingest_metrics(from_ts, to_ts)
-                        .await
-                        .and_then(|reset| {
-                            serde_json::to_value(json!({ "reset": reset }))
-                                .map(|value| ControlResponse::ok(None, Some(value)))
-                                .map_err(GitAiError::from)
-                        })
-                } else {
-                    Err(GitAiError::Generic(
-                        "telemetry worker is not available".to_string(),
-                    ))
-                }
-            }
             ControlRequest::StatsIngest => serde_json::to_value(IngestLossSnapshot::capture(self))
                 .map(|v| ControlResponse::ok(None, Some(v)))
                 .map_err(GitAiError::from),
@@ -10444,7 +10335,6 @@ fn should_defer_restart_for_checkpoints(
 pub(crate) struct IngestLossSnapshot {
     trace_payloads_dropped_queue_full: u64,
     trace_connections_dropped: u64,
-    telemetry_metric_batches_dropped: u64,
     checkpoints_dropped: u64,
 }
 
@@ -10457,30 +10347,20 @@ impl IngestLossSnapshot {
             trace_connections_dropped: coordinator
                 .trace_connections_dropped
                 .load(Ordering::Relaxed),
-            telemetry_metric_batches_dropped:
-                crate::daemon::telemetry_worker::metric_batches_dropped(),
             checkpoints_dropped: coordinator.checkpoints_dropped.load(Ordering::Relaxed),
         }
     }
 }
 
-/// Persist a DaemonIngestAnomaly metric with the loss deltas since the
-/// previous report, so silent attribution loss becomes visible in fleet
-/// telemetry. Called from the health loop, from graceful teardown (so a
-/// queue-full shutdown still reports its loss), and from the shutdown
-/// enforcer.
-///
-/// Unlike sibling emitters this stores straight to the metrics DB instead of
-/// going through `crate::metrics::record`: the persistence queue is exactly
-/// the lossy component whose drops are being reported, and the snapshot must
-/// only advance when the write was actually accepted (otherwise a dropped
-/// emission permanently unreports its window).
+/// Log the loss deltas since the previous report, so silent attribution loss
+/// shows in the daemon log. Called from the health loop, from graceful
+/// teardown (so a queue-full shutdown still reports its loss), and from the
+/// shutdown enforcer. Upstream also sent these as a metric; this fork sends
+/// nothing anywhere.
 fn report_ingest_losses(coordinator: &Arc<ActorDaemonCoordinator>) {
-    use crate::metrics::pos_encoded::PosEncoded as _;
-
     // try_lock: the shutdown enforcer calls this right before a forced exit
     // and must never block; a contended lock just means another reporter is
-    // already delivering the same deltas.
+    // already logging the same deltas.
     let mut last_reported = match coordinator.last_reported_ingest_losses.try_lock() {
         Ok(guard) => guard,
         Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
@@ -10490,28 +10370,19 @@ fn report_ingest_losses(coordinator: &Arc<ActorDaemonCoordinator>) {
     if current == *last_reported {
         return;
     }
-    let values = crate::metrics::events::DaemonIngestAnomalyValues::new(
-        current
+    tracing::warn!(
+        trace_payloads_dropped_queue_full = current
             .trace_payloads_dropped_queue_full
             .saturating_sub(last_reported.trace_payloads_dropped_queue_full),
-        current
+        trace_connections_dropped = current
             .trace_connections_dropped
             .saturating_sub(last_reported.trace_connections_dropped),
-        current
-            .telemetry_metric_batches_dropped
-            .saturating_sub(last_reported.telemetry_metric_batches_dropped),
-        current
+        checkpoints_dropped = current
             .checkpoints_dropped
             .saturating_sub(last_reported.checkpoints_dropped),
+        "daemon dropped ingest work since the last report"
     );
-    let attrs = crate::metrics::EventAttributes::with_version(env!("CARGO_PKG_VERSION"));
-    let event = crate::metrics::MetricEvent::from_values(values, attrs.to_sparse());
-    match crate::daemon::telemetry_worker::persist_metrics_now(&[event]) {
-        Ok(()) => *last_reported = current,
-        Err(error) => {
-            tracing::warn!(%error, "failed persisting ingest-loss metric; will retry next report");
-        }
-    }
+    *last_reported = current;
 }
 
 const TRACE_DRAIN_PROBE_DEADLINE: Duration = Duration::from_secs(5);
@@ -10566,14 +10437,13 @@ fn trace_drain_probe_round_trip(
     }
 }
 
-/// Background loop that periodically checks for available updates.
+/// Background maintenance loop: collects stale family state and restarts the
+/// daemon once it has been up longer than its maximum uptime. (Upstream also
+/// checked for git-ai updates here; this fork never updates itself.)
 ///
 /// Sleeps in short increments so it can exit promptly when the coordinator
-/// signals shutdown.  When an update is detected, it requests a graceful
-/// shutdown so the daemon can self-update after draining in-flight work.
+/// signals shutdown.
 fn daemon_update_check_loop(coordinator: Arc<ActorDaemonCoordinator>, started_at_ns: u128) {
-    use crate::commands::upgrade::{DaemonUpdateCheckResult, check_for_update_available};
-
     let interval = daemon_update_check_interval().max(1);
 
     loop {
@@ -10596,32 +10466,6 @@ fn daemon_update_check_loop(coordinator: Arc<ActorDaemonCoordinator>, started_at
 
         coordinator.gc_stale_family_state();
 
-        match check_for_update_available() {
-            Ok(DaemonUpdateCheckResult::UpdateReady) => {
-                let (outstanding_checkpoints, retained_checkpoint_bytes) =
-                    coordinator.outstanding_checkpoint_state();
-                // Also defer while queued or executing attribution work
-                // remains: process teardown would abandon it (#2252).
-                if coordinator.has_pending_attribution_work() {
-                    tracing::info!(
-                        outstanding_checkpoints,
-                        retained_checkpoint_bytes,
-                        "update restart deferred while attribution work remains"
-                    );
-                } else {
-                    tracing::info!("update check: newer version available, requesting shutdown");
-                    coordinator.request_restart_after_update();
-                    return;
-                }
-            }
-            Ok(DaemonUpdateCheckResult::NoUpdate) => {
-                tracing::info!("update check: no update needed");
-            }
-            Err(err) => {
-                tracing::warn!(%err, "update check failed");
-            }
-        }
-
         let uptime_ns = now_unix_nanos().saturating_sub(started_at_ns);
         if uptime_ns >= daemon_max_uptime_ns() {
             let (outstanding_checkpoints, retained_checkpoint_bytes) =
@@ -10639,33 +10483,6 @@ fn daemon_update_check_loop(coordinator: Arc<ActorDaemonCoordinator>, started_at
                 coordinator.request_restart();
                 return;
             }
-        }
-    }
-}
-
-/// After the daemon has fully shut down, attempt to install any pending update.
-///
-/// On Unix the installer atomically replaces the binary via `mv`; on Windows
-/// the installer is spawned as a detached process that polls until the exe is
-/// unlocked.
-pub(crate) fn daemon_run_pending_self_update() -> DaemonSelfUpdateOutcome {
-    use crate::commands::upgrade::{
-        DaemonUpdateCheckResult, check_and_install_update_if_available,
-    };
-
-    match check_and_install_update_if_available() {
-        Ok(DaemonUpdateCheckResult::UpdateReady) => {
-            tracing::info!("self-update: installation completed successfully");
-            DaemonSelfUpdateOutcome::Installed
-        }
-        Ok(DaemonUpdateCheckResult::NoUpdate) => {
-            tracing::info!("self-update: no update to install");
-            DaemonSelfUpdateOutcome::NoUpdate
-        }
-        Err(err) => {
-            tracing::warn!(%err, "self-update: installation failed");
-            crate::commands::upgrade::clear_cached_update_state();
-            DaemonSelfUpdateOutcome::Failed
         }
     }
 }
@@ -10699,8 +10516,6 @@ pub(crate) async fn run_daemon(config: DaemonConfig) -> Result<DaemonExitAction,
                     .with_ansi(false)
                     .with_writer(std::io::stderr),
             )
-            .with(crate::daemon::sentry_layer::SentryLayer)
-            .with(crate::daemon::daemon_log_layer::DaemonLogUploadLayer)
             .init();
     }
 
@@ -10718,11 +10533,6 @@ pub(crate) async fn run_daemon(config: DaemonConfig) -> Result<DaemonExitAction,
     remove_socket_if_exists(&config.control_socket_path)?;
 
     let mut coordinator_inner = ActorDaemonCoordinator::new();
-
-    // Spawn the telemetry worker inside the daemon's tokio runtime.
-    let telemetry_handle = crate::daemon::telemetry_worker::spawn_telemetry_worker();
-    crate::daemon::telemetry_worker::set_daemon_internal_telemetry(telemetry_handle.clone());
-    coordinator_inner.telemetry_worker = Some(telemetry_handle.clone());
 
     coordinator_inner.untraced_fixup_ignore = Mutex::new(
         crate::daemon::untraced_fixup_ignore::UntracedFixupIgnore::from_config(
@@ -10777,7 +10587,7 @@ pub(crate) async fn run_daemon(config: DaemonConfig) -> Result<DaemonExitAction,
                             Some(crate::daemon::token_usage_worker::spawn_token_usage_worker(
                                 streams_db.clone(),
                                 std::sync::Arc::new(token_db),
-                                telemetry_handle.clone(),
+                                crate::daemon::local_metrics::LocalMetricsSink,
                                 token_usage_shutdown_notify.clone(),
                             ))
                         }
@@ -10791,7 +10601,7 @@ pub(crate) async fn run_daemon(config: DaemonConfig) -> Result<DaemonExitAction,
                 };
                 let transcript_handle = crate::daemon::stream_worker::spawn_stream_worker(
                     streams_db.clone(),
-                    telemetry_handle.clone(),
+                    crate::daemon::local_metrics::LocalMetricsSink,
                     shutdown_notify.clone(),
                     token_usage_handle.clone(),
                 );
@@ -10813,18 +10623,7 @@ pub(crate) async fn run_daemon(config: DaemonConfig) -> Result<DaemonExitAction,
     }
 
     let coordinator = Arc::new(coordinator_inner);
-    // Heartbeats carry the pipeline health snapshot. The provider holds a Weak
-    // reference so the telemetry worker never extends the coordinator's life.
-    let heartbeat_coordinator = Arc::downgrade(&coordinator);
-    crate::daemon::telemetry_worker::set_daemon_heartbeat_fields_provider(Arc::new(move || {
-        heartbeat_coordinator
-            .upgrade()
-            .map(|coordinator| {
-                crate::daemon::health::DaemonHealthSnapshot::capture(&coordinator)
-                    .heartbeat_fields()
-            })
-            .unwrap_or_default()
-    }));
+
     coordinator.start_trace_ingest_worker()?;
     coordinator.start_checkpoint_ingress_worker()?;
     if config::Config::get()
@@ -10921,15 +10720,6 @@ pub(crate) async fn run_daemon(config: DaemonConfig) -> Result<DaemonExitAction,
         std::thread::sleep(std::time::Duration::from_secs(hang_secs));
     }
 
-    // Metric batches still sitting in the persistence queue must reach SQLite
-    // before this process exits, or a restart silently loses them.
-    if let Some(worker) = &coordinator.telemetry_worker
-        && !worker
-            .drain_metrics_persist_queue(std::time::Duration::from_secs(2))
-            .await
-    {
-        tracing::warn!("telemetry metrics persist queue was not fully drained at shutdown");
-    }
 
     // Final loss report: a shutdown caused by a full ingest queue is the
     // severest attribution-loss event; persisting the deltas here lets the
@@ -11052,7 +10842,7 @@ fn spawn_shutdown_deadline_enforcer(
             }
             if matches!(
                 coordinator.shutdown_action(),
-                DaemonExitAction::Restart | DaemonExitAction::RestartAfterUpdate
+                DaemonExitAction::Restart
             ) && let Err(e) = spawn_self_restart(&restart_history_path)
             {
                 tracing::error!("failed to spawn self-restart: {}", e);
@@ -11100,7 +10890,6 @@ fn checkpoint_control_response_timeout(
         ControlRequest::Await { timeout_secs } => {
             Duration::from_secs(timeout_secs.saturating_add(5))
         }
-        ControlRequest::ReingestMetrics { .. } => DAEMON_CHECKPOINT_RESPONSE_TIMEOUT,
         ControlRequest::Shutdown => DAEMON_CHECKPOINT_RESPONSE_TIMEOUT,
         _ => DAEMON_CONTROL_RESPONSE_TIMEOUT,
     }
@@ -12149,11 +11938,8 @@ mod tests {
         runtime.block_on(async {
             let coordinator = ActorDaemonCoordinator::new();
 
-            coordinator.request_restart_after_update();
-            assert_eq!(
-                coordinator.shutdown_action(),
-                DaemonExitAction::RestartAfterUpdate
-            );
+            coordinator.request_restart();
+            assert_eq!(coordinator.shutdown_action(), DaemonExitAction::Restart);
 
             coordinator.request_stop();
 

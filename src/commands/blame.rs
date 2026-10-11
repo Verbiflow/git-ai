@@ -1,4 +1,3 @@
-use crate::auth::CredentialStore;
 use crate::authorship::authorship_log::{HumanRecord, PromptRecord, SessionRecord};
 use crate::authorship::authorship_log_serialization::AuthorshipLog;
 use crate::authorship::working_log::CheckpointKind;
@@ -1408,12 +1407,8 @@ fn output_json_format(
         .collect();
 
     // Compute metadata
-    let is_logged_in = CredentialStore::new()
-        .load()
-        .ok()
-        .flatten()
-        .map(|creds| !creds.is_refresh_token_expired())
-        .unwrap_or(false);
+    // This fork has no git-ai account to log in to.
+    let is_logged_in = false;
 
     let current_user = repo.effective_author_identity().formatted();
 

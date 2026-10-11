@@ -6,7 +6,7 @@
 
 use crate::authorship::authorship_log_serialization::{generate_session_id, generate_trace_id};
 use crate::config;
-use crate::daemon::telemetry_worker::DaemonTelemetryWorkerHandle;
+use crate::daemon::local_metrics::LocalMetricsSink;
 use crate::daemon::transcript_redaction::redact_json_secrets;
 use crate::metrics::{
     EventAttributes, MetricEvent, OtelTraceValues, PosEncoded, SessionEventValues,
@@ -305,7 +305,7 @@ struct StreamWorker {
     priority_queue: BinaryHeap<ProcessingTask>,
     delayed_tasks: Vec<ProcessingTask>,
     in_flight: HashSet<(PathBuf, String)>,
-    telemetry_handle: DaemonTelemetryWorkerHandle,
+    telemetry_handle: LocalMetricsSink,
     shutdown_notify: Arc<Notify>,
     shutdown_flag: Arc<AtomicBool>,
     checkpoint_rx: tokio::sync::mpsc::UnboundedReceiver<CheckpointNotification>,
@@ -322,7 +322,7 @@ impl StreamWorker {
     #[allow(clippy::too_many_arguments)]
     fn new(
         streams_db: Arc<StreamsDatabase>,
-        telemetry_handle: DaemonTelemetryWorkerHandle,
+        telemetry_handle: LocalMetricsSink,
         shutdown_notify: Arc<Notify>,
         shutdown_flag: Arc<AtomicBool>,
         checkpoint_rx: tokio::sync::mpsc::UnboundedReceiver<CheckpointNotification>,
@@ -1014,7 +1014,7 @@ impl StreamWorker {
     /// the 3-second flush cycle drain it.
     fn process_session_blocking(
         db: &StreamsDatabase,
-        telemetry: &DaemonTelemetryWorkerHandle,
+        telemetry: &LocalMetricsSink,
         task: &ProcessingTask,
         shutdown_flag: &AtomicBool,
     ) -> Result<(), StreamError> {
@@ -1393,7 +1393,7 @@ impl StreamWorker {
 /// Spawn the transcript worker.
 pub fn spawn_stream_worker(
     streams_db: Arc<StreamsDatabase>,
-    telemetry_handle: DaemonTelemetryWorkerHandle,
+    telemetry_handle: LocalMetricsSink,
     shutdown_notify: Arc<Notify>,
     token_usage_worker: Option<crate::daemon::token_usage_worker::TokenUsageWorkerHandle>,
 ) -> StreamWorkerHandle {
@@ -1498,7 +1498,7 @@ mod scheduling_tests {
         let (_drain_tx, drain_rx) = tokio::sync::mpsc::unbounded_channel();
         let shutdown = Arc::new(Notify::new());
         let shutdown_flag = Arc::new(AtomicBool::new(false));
-        let telemetry = DaemonTelemetryWorkerHandle::new_noop();
+        let telemetry = LocalMetricsSink::new_noop();
         let sweep_trigger_gate = SweepTriggerGate::new();
         assert!(sweep_trigger_gate.try_mark_sweep_at(Instant::now(), "test"));
         let worker = StreamWorker::new(
@@ -1678,7 +1678,7 @@ mod subagent_sweep_tests {
         let (_drain_tx, drain_rx) = tokio::sync::mpsc::unbounded_channel();
         let shutdown = Arc::new(Notify::new());
         let shutdown_flag = Arc::new(AtomicBool::new(false));
-        let telemetry = DaemonTelemetryWorkerHandle::new_noop();
+        let telemetry = LocalMetricsSink::new_noop();
         StreamWorker::new(
             db,
             telemetry,

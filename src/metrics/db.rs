@@ -233,24 +233,6 @@ impl MetricsDatabase {
         Ok(db)
     }
 
-    #[cfg(test)]
-    pub(crate) fn new_temp_for_tests() -> Result<(Self, tempfile::TempDir), GitAiError> {
-        let temp_dir = tempfile::TempDir::new()?;
-        let db_path = temp_dir.path().join("metrics.db");
-        let conn = crate::sqlite::open_with_memory_limits(&db_path)?;
-        conn.execute_batch(
-            r#"
-            PRAGMA journal_mode=WAL;
-            PRAGMA synchronous=NORMAL;
-            "#,
-        )?;
-
-        let mut db = Self { conn };
-        db.initialize_schema()?;
-
-        Ok((db, temp_dir))
-    }
-
     #[cfg(any(test, feature = "test-support"))]
     pub fn open_at_path(path: &std::path::Path) -> Result<Self, GitAiError> {
         if let Some(parent) = path.parent() {

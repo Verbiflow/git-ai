@@ -1,15 +1,10 @@
-use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::api::types::{DaemonLogEvent, DaemonLogFieldValue, DaemonLogKind, DaemonLogLevel};
-
 use super::ActorDaemonCoordinator;
-use super::telemetry_worker::{EmergencyLogUploadStatus, upload_emergency_daemon_log};
 
 const EMERGENCY_PERCENT: u64 = 85;
-const EMERGENCY_LOG_UPLOAD_TIMEOUT: Duration = Duration::from_millis(500);
 const WATCHDOG_POLL_INTERVAL: Duration = Duration::from_secs(1);
 #[cfg(feature = "test-support")]
 pub(super) const TEST_PEAK_RSS_SEQUENCE_ENV: &str = "GIT_AI_TEST_DAEMON_PEAK_RSS_MB_SEQUENCE";
@@ -110,42 +105,6 @@ fn record_memory_emergency(
         "[git-ai] daemon memory emergency threshold reached (peak RSS {peak_rss_bytes} bytes, emergency threshold {} bytes, hard limit {} bytes); {action}ing immediately without draining",
         thresholds.emergency_bytes, thresholds.limit_bytes
     );
-    let _ = io::stderr().flush();
-
-    let mut fields = BTreeMap::new();
-    fields.insert(
-        "peak_rss_bytes".to_string(),
-        DaemonLogFieldValue::from(peak_rss_bytes),
-    );
-    fields.insert(
-        "memory_emergency_threshold_bytes".to_string(),
-        DaemonLogFieldValue::from(thresholds.emergency_bytes),
-    );
-    fields.insert(
-        "memory_limit_bytes".to_string(),
-        DaemonLogFieldValue::from(thresholds.limit_bytes),
-    );
-    fields.insert("action".to_string(), DaemonLogFieldValue::from(action));
-    let event = DaemonLogEvent {
-        id: Some(crate::uuid::generate_v4()),
-        kind: DaemonLogKind::Log,
-        timestamp: chrono::Utc::now().to_rfc3339(),
-        level: DaemonLogLevel::Error,
-        target: Some("git_ai::daemon::memory_watchdog".to_string()),
-        message: "daemon memory emergency threshold reached".to_string(),
-        fields,
-        repo_url: None,
-        git_ai_version: None,
-    };
-    match upload_emergency_daemon_log(event, EMERGENCY_LOG_UPLOAD_TIMEOUT) {
-        EmergencyLogUploadStatus::Completed => {}
-        EmergencyLogUploadStatus::TimedOut => {
-            eprintln!("[git-ai] emergency daemon log upload timed out; continuing shutdown");
-        }
-        EmergencyLogUploadStatus::ThreadUnavailable => {
-            eprintln!("[git-ai] emergency daemon log upload could not start; continuing shutdown");
-        }
-    }
     let _ = io::stderr().flush();
 }
 
