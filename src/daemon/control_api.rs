@@ -1,6 +1,5 @@
 use crate::authorship::working_log::AgentId;
 use crate::commands::checkpoint_agent::bash_tool::StatSnapshot;
-use crate::metrics::MetricEvent;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -16,20 +15,6 @@ pub enum ControlRequest {
     SyncFamily { repo_working_dir: String },
     #[serde(rename = "status.family")]
     StatusFamily { repo_working_dir: String },
-    #[serde(rename = "telemetry.submit")]
-    SubmitTelemetry { envelopes: Vec<TelemetryEnvelope> },
-    #[serde(rename = "cas.submit")]
-    SubmitCas { records: Vec<CasSyncPayload> },
-    /// Signal the daemon that new notes are pending in notes-db and should be flushed.
-    #[serde(rename = "notes.flush")]
-    FlushNotes,
-    /// Reset local metric delivery state for a half-open event-time range, or
-    /// for all rows when both bounds are absent.
-    #[serde(rename = "metrics.reingest")]
-    ReingestMetrics {
-        from_ts: Option<u32>,
-        to_ts: Option<u32>,
-    },
     /// Report ingest loss counters (dropped trace payloads/connections).
     #[serde(rename = "stats.ingest")]
     StatsIngest,
@@ -161,65 +146,9 @@ pub struct FamilyStatus {
     pub last_error: Option<String>,
 }
 
-/// A telemetry envelope sent from client to daemon.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum TelemetryEnvelope {
-    Error {
-        timestamp: String,
-        message: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        context: Option<Value>,
-    },
-    Performance {
-        timestamp: String,
-        operation: String,
-        duration_ms: u128,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        context: Option<Value>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        tags: Option<std::collections::HashMap<String, String>>,
-    },
-    Message {
-        timestamp: String,
-        message: String,
-        level: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        context: Option<Value>,
-    },
-    Metrics {
-        events: Vec<MetricEvent>,
-    },
-}
-
-/// A CAS object payload sent from client to daemon for background upload.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CasSyncPayload {
-    pub hash: String,
-    pub data: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<String>,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn metrics_reingest_request_uses_stable_wire_shape() {
-        let request = ControlRequest::ReingestMetrics {
-            from_ts: Some(100),
-            to_ts: Some(200),
-        };
-
-        assert_eq!(
-            serde_json::to_value(request).unwrap(),
-            serde_json::json!({
-                "method": "metrics.reingest",
-                "params": { "from_ts": 100, "to_ts": 200 }
-            })
-        );
-    }
 
     #[test]
     fn status_daemon_request_uses_stable_wire_shape() {

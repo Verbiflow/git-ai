@@ -641,35 +641,17 @@ pub fn is_vsc_editor_extension_installed(
     )))
 }
 
-/// Install a VS Code extension
+/// Install a VS Code extension. Never does in this fork: installing makes the
+/// editor download git-ai's extension from the marketplace, and this fork
+/// contacts no outside service. Callers fall back to telling the user how to
+/// install it themselves.
 pub fn install_vsc_editor_extension(
     cli: &EditorCliCommand,
     id_or_vsix: &str,
 ) -> Result<(), GitAiError> {
-    // NOTE: We try up to 3 times, because the editor CLI can be flaky (throws intermittent JS errors)
-    let mut last_error_message: Option<String> = None;
-    for attempt in 1..=3 {
-        let cmd_status = cli
-            .command(&["--install-extension", id_or_vsix, "--force"])
-            .status();
-
-        match cmd_status {
-            Ok(status) => {
-                if status.success() {
-                    return Ok(());
-                }
-                last_error_message = Some(format!("{} extension install failed", cli.program));
-            }
-            Err(e) => {
-                last_error_message = Some(e.to_string());
-            }
-        }
-        if attempt < 3 {
-            std::thread::sleep(std::time::Duration::from_millis(300));
-        }
-    }
-    Err(GitAiError::Generic(last_error_message.unwrap_or_else(
-        || format!("{} extension install failed", cli.program),
+    Err(GitAiError::Generic(format!(
+        "not installing {id_or_vsix} with {}: this build does not download extensions",
+        cli.program
     )))
 }
 

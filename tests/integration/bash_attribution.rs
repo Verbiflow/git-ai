@@ -25,7 +25,7 @@ fn isolated_bash_history_db_path() -> (tempfile::TempDir, String) {
 }
 
 #[test]
-fn test_bash_pre_legacy_checkpoint_recovers_dirty_edge_attribution() {
+fn test_bash_pre_legacy_checkpoint_leaves_dirty_line_to_its_writer() {
     let repo = TestRepo::new();
     let file_path = repo.path().join("example.txt");
 
@@ -47,9 +47,12 @@ fn test_bash_pre_legacy_checkpoint_recovers_dirty_edge_attribution() {
         .unwrap();
 
     repo.stage_all_and_commit("After bash").unwrap();
+    // The dirty line predates the AI checkpoint; nothing credits it to the
+    // agent (this fork drops the adjacency guess, VER-84), so the committer
+    // keeps it.
     file.assert_committed_lines(lines![
         "original line".unattributed_human(),
-        "dirty pre-bash line".ai(),
+        "dirty pre-bash line".human(),
         "ai bash line".ai(),
     ]);
 }
@@ -108,7 +111,8 @@ fn test_bash_multiple_files_mixed_dirty_state() {
     repo.stage_all_and_commit("After bash").unwrap();
     file_a.assert_committed_lines(lines![
         "line a".unattributed_human(),
-        "dirty touched a".ai(),
+        // Dirty before the AI checkpoint: not the agent's (no adjacency guess).
+        "dirty touched a".human(),
         "bash touched a".ai(),
     ]);
     file_b.assert_committed_lines(lines!["line b".unattributed_human(), "bash touched b".ai()]);
@@ -430,7 +434,8 @@ fn test_bash_recovery_uses_commit_time_file_timestamps_when_processing_is_delaye
     .unwrap();
 
     let mut file = repo.filename("delayed.txt");
-    file.assert_committed_lines(lines!["dirty pre-bash line".ai(), "ai bash line".ai(),]);
+    // Dirty before the bash call: not the agent's (no adjacency guess).
+    file.assert_committed_lines(lines!["dirty pre-bash line".human(), "ai bash line".ai(),]);
 }
 
 #[test]
@@ -895,66 +900,6 @@ fn test_edge_extension_recovers_unknown_gap_between_ai_attributions() {
     ]);
 }
 
-#[test]
-fn test_edge_extension_recovers_leading_and_trailing_unknown_lines_near_ai_block() {
-    let repo = TestRepo::new();
-    let file_path = repo.path().join("edge-fringes.txt");
-
-    fs::write(&file_path, "base\n").unwrap();
-    repo.stage_all_and_commit("Initial commit").unwrap();
-
-    fs::write(
-        &file_path,
-        "\
-base
-leading dirty
-ai one placeholder
-ai two placeholder
-ai three placeholder
-trailing dirty 1
-trailing dirty 2
-trailing dirty 3
-trailing dirty 4
-",
-    )
-    .unwrap();
-    repo.git_ai(&["checkpoint", "human", "edge-fringes.txt"])
-        .expect("legacy human checkpoint should mark current content untracked");
-
-    fs::write(
-        &file_path,
-        "\
-base
-leading dirty
-ai one
-ai two
-ai three
-trailing dirty 1
-trailing dirty 2
-trailing dirty 3
-trailing dirty 4
-",
-    )
-    .unwrap();
-    repo.git_ai(&["checkpoint", "mock_ai", "edge-fringes.txt"])
-        .expect("AI checkpoint should only directly attribute the edited block");
-
-    repo.stage_all_and_commit("Recover edge fringes").unwrap();
-
-    let mut file = repo.filename("edge-fringes.txt");
-    file.assert_committed_lines(lines![
-        "base".unattributed_human(),
-        "leading dirty".ai(),
-        "ai one".ai(),
-        "ai two".ai(),
-        "ai three".ai(),
-        "trailing dirty 1".ai(),
-        "trailing dirty 2".ai(),
-        "trailing dirty 3".ai(),
-        "trailing dirty 4".unattributed_human(),
-    ]);
-}
-
 fn isolated_metrics_db_path() -> (tempfile::TempDir, String) {
     let dir = tempfile::tempdir().expect("failed to create isolated metrics db dir");
     let path = dir.path().join("metrics.db");
@@ -1010,70 +955,4 @@ fn wait_for_edge_recovery_metric(db_path: &str) -> MetricEvent {
         }
         thread::sleep(Duration::from_millis(50));
     }
-}
-
-#[test]
-fn test_edge_extension_recovery_metric_copies_source_session_tool_and_model() {
-    let (_metrics_db_dir, metrics_db_path) = isolated_metrics_db_path();
-    let repo =
-        TestRepo::new_with_daemon_env(&[("GIT_AI_TEST_METRICS_DB_PATH", metrics_db_path.as_str())]);
-    let repo_root = repo.canonical_path();
-    let file_path = repo.path().join("edge.txt");
-    let transcript_path = repo_root.join("session.jsonl");
-    fs::write(
-        &transcript_path,
-        r#"{"message":{"role":"assistant","model":"claude-sonnet-4"}}
-"#,
-    )
-    .unwrap();
-
-    fs::write(&file_path, "base\n").unwrap();
-    repo.stage_all_and_commit("Initial commit").unwrap();
-
-    // Two AI checkpoints so the neighboring lines get different traces.
-    // Virtual attribution only fills gaps when both neighbors share the same
-    // author hash; edge recovery also bridges the same session across traces.
-    fs::write(&file_path, "base\nai before\n").unwrap();
-    claude_file_edit_checkpoint(&repo, &file_path, &transcript_path, "PreToolUse");
-    fs::write(&file_path, "base\nai before edited\n").unwrap();
-    claude_file_edit_checkpoint(&repo, &file_path, &transcript_path, "PostToolUse");
-
-    fs::write(&file_path, "base\nai before edited\nai after\n").unwrap();
-    claude_file_edit_checkpoint(&repo, &file_path, &transcript_path, "PreToolUse");
-    fs::write(&file_path, "base\nai before edited\nai after edited\n").unwrap();
-    claude_file_edit_checkpoint(&repo, &file_path, &transcript_path, "PostToolUse");
-
-    fs::write(
-        &file_path,
-        "base\nai before edited\nunknown gap\nai after edited\n",
-    )
-    .unwrap();
-
-    repo.stage_all_and_commit("Recover edge attribution")
-        .unwrap();
-
-    let mut file = repo.filename("edge.txt");
-    file.assert_committed_lines(lines![
-        "base".unattributed_human(),
-        "ai before edited".ai(),
-        "unknown gap".ai(),
-        "ai after edited".ai(),
-    ]);
-
-    let event = wait_for_edge_recovery_metric(&metrics_db_path);
-    assert_eq!(
-        sparse_str(&event.attrs, attr_pos::TOOL),
-        Some("claude"),
-        "edge recovery metric should copy the neighboring AI session tool"
-    );
-    assert_eq!(
-        sparse_str(&event.attrs, attr_pos::MODEL),
-        Some("claude-sonnet-4"),
-        "edge recovery metric should copy the neighboring AI session model"
-    );
-    assert_eq!(
-        sparse_str(&event.attrs, attr_pos::EXTERNAL_SESSION_ID),
-        Some("edge-metric-session"),
-        "edge recovery metric should copy the neighboring AI session id"
-    );
 }

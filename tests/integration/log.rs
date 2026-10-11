@@ -1,7 +1,6 @@
 use crate::repos::test_file::ExpectedLineExt;
 use crate::repos::test_repo::TestRepo;
 use git_ai::config::{NotesBackendConfig, NotesBackendKind};
-use git_ai::notes::db::NotesDatabase;
 
 #[test]
 fn log_default_shows_stats_without_raw_note() {
@@ -141,58 +140,5 @@ fn log_plain_rejects_http_backend() {
         err.contains("plain git log --notes=ai only supports the git_notes backend"),
         "error:\n{}",
         err
-    );
-}
-
-#[test]
-fn log_http_backend_reads_notes_db_without_git_notes_ref() {
-    let mut repo = TestRepo::new();
-    let mut file = repo.filename("http.txt");
-    file.set_contents(lines!["AI http line".ai()]);
-    repo.stage_all_and_commit("feat: http note").unwrap();
-
-    let sha = repo
-        .git(&["rev-parse", "HEAD"])
-        .expect("rev-parse should succeed")
-        .trim()
-        .to_string();
-    let note = repo
-        .read_authorship_note(&sha)
-        .expect("authorship note should exist before deleting refs/notes/ai");
-
-    repo.git_og(&["update-ref", "-d", "refs/notes/ai"])
-        .expect("delete refs/notes/ai");
-    assert!(
-        repo.read_authorship_note(&sha).is_none(),
-        "precondition failed: refs/notes/ai should be absent"
-    );
-
-    let notes_db_path = repo.test_home_path().join("http-log-notes.db");
-    let mut db = NotesDatabase::open_at_path(&notes_db_path).expect("open notes db");
-    db.cache_synced_notes(&[(sha.clone(), note)])
-        .expect("seed notes db");
-
-    repo.patch_git_ai_config(|patch| {
-        patch.notes_backend = Some(NotesBackendConfig {
-            kind: NotesBackendKind::Http,
-            backend_url: None,
-        });
-    });
-
-    let notes_db_path_string = notes_db_path.to_string_lossy().to_string();
-    let output = repo
-        .git_ai_with_env(
-            &["log", "--no-pager", "--notes", "-n", "1"],
-            &[("GIT_AI_TEST_NOTES_DB_PATH", notes_db_path_string.as_str())],
-        )
-        .expect("git-ai log should read HTTP notes cache");
-
-    assert!(output.contains("feat: http note"), "output:\n{}", output);
-    assert!(output.contains("Git AI stats:"), "output:\n{}", output);
-    assert!(output.contains("Authorship note:"), "output:\n{}", output);
-    assert!(
-        output.contains("schema_version"),
-        "raw note content should come from notes-db:\n{}",
-        output
     );
 }

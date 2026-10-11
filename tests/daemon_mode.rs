@@ -1687,6 +1687,7 @@ fn daemon_stalled_unidentified_trace_connection_does_not_block_checkpoint_contro
         path_role: PreparedPathRole::Edited,
         stream_source: None,
         metadata: Default::default(),
+        tool_call: None,
     };
 
     let response =
@@ -1735,6 +1736,7 @@ fn daemon_checkpoint_resolution_applies_total_content_budget() {
         path_role: PreparedPathRole::Edited,
         stream_source: None,
         metadata: Default::default(),
+        tool_call: None,
     };
 
     let response =
@@ -1883,6 +1885,7 @@ fn daemon_checkpoint_ack_preserves_order_with_immediate_commit() {
         path_role: PreparedPathRole::Edited,
         stream_source: None,
         metadata: Default::default(),
+        tool_call: None,
     };
 
     let started = std::time::Instant::now();
@@ -1960,6 +1963,7 @@ fn daemon_soft_shutdown_drains_acknowledged_checkpoints() {
         path_role: PreparedPathRole::Edited,
         stream_source: None,
         metadata: Default::default(),
+        tool_call: None,
     };
 
     fs::write(repo.path().join("first.txt"), "first\n").unwrap();
@@ -2070,6 +2074,7 @@ fn daemon_drains_independent_checkpoint_families_concurrently() {
         path_role: PreparedPathRole::Edited,
         stream_source: None,
         metadata: Default::default(),
+        tool_call: None,
     };
 
     fs::write(
@@ -2167,6 +2172,7 @@ fn family_side_effect_grind_does_not_stall_independent_checkpoint_admission() {
         path_role: PreparedPathRole::Edited,
         stream_source: None,
         metadata: Default::default(),
+        tool_call: None,
     };
     let response =
         send_checkpoint_request_with_timeout(&control_socket, &checkpoint, Duration::from_secs(2))
@@ -2236,6 +2242,7 @@ fn checkpoint_admission_proceeds_while_same_family_side_effects_grind() {
         path_role: PreparedPathRole::Edited,
         stream_source: None,
         metadata: Default::default(),
+        tool_call: None,
     };
     let response = send_checkpoint_request_with_timeout(
         &daemon_control_socket_path(&repo),
@@ -2492,6 +2499,7 @@ fn delayed_checkpoint_admission_is_logged() {
         path_role: PreparedPathRole::Edited,
         stream_source: None,
         metadata: Default::default(),
+        tool_call: None,
     };
     let response = send_checkpoint_request_with_timeout(
         &daemon_control_socket_path(&repo),
@@ -2538,6 +2546,7 @@ fn daemon_checkpoint_processing_failure_is_logged_after_receipt_ack() {
         path_role: PreparedPathRole::Edited,
         stream_source: None,
         metadata: Default::default(),
+        tool_call: None,
     };
 
     let receipt = send_checkpoint_request_with_timeout(
@@ -2626,6 +2635,7 @@ fn daemon_async_checkpoint_receipts_preserve_file_edit_order_before_commit() {
         path_role: PreparedPathRole::WillEdit,
         stream_source: None,
         metadata: Default::default(),
+        tool_call: None,
     };
     let pre_receipt = send_checkpoint_request_with_timeout(
         &control_socket,
@@ -2659,6 +2669,7 @@ fn daemon_async_checkpoint_receipts_preserve_file_edit_order_before_commit() {
         path_role: PreparedPathRole::Edited,
         stream_source: None,
         metadata: Default::default(),
+        tool_call: None,
     };
     let post_receipt = send_checkpoint_request_with_timeout(
         &control_socket,
@@ -2783,6 +2794,7 @@ fn daemon_checkpoint_initial_base_does_not_fall_back_to_processing_time_head() {
         path_role: PreparedPathRole::Edited,
         stream_source: None,
         metadata: Default::default(),
+        tool_call: None,
     };
 
     let response =
@@ -3119,6 +3131,7 @@ fn daemon_partial_trace_line_does_not_block_checkpoint_control_request() {
         path_role: PreparedPathRole::Edited,
         stream_source: None,
         metadata: Default::default(),
+        tool_call: None,
     };
 
     let response =
@@ -6362,6 +6375,7 @@ fn daemon_memory_threshold_logs_uploads_and_aborts_without_draining() {
         path_role: PreparedPathRole::Edited,
         stream_source: None,
         metadata: Default::default(),
+        tool_call: None,
     };
     let checkpoint_response = send_checkpoint_request_with_timeout(
         &daemon.control_socket_path,
@@ -7871,129 +7885,6 @@ fn await_blocks_until_queued_metrics_are_persisted() {
         output,
         repo.daemon_stderr_contents()
     );
-}
-
-/// The `notes.flush` control trigger must route through the serialized flush
-/// loop. A bare concurrent `flush_notes` dequeue-locks the note rows
-/// (`processing_started_at`) out from under an awaited flush, whose pending
-/// count excludes locked rows — so `await` certifies "0 notes remaining"
-/// while the triggered upload has not reached the backend yet. This test
-/// sends the trigger the way production does (an external control client,
-/// since the daemon's own in-process `submit_notes` is a deliberate no-op)
-/// and awaits during the stalled upload. Timing caveat: the 3s periodic
-/// cycle can occasionally win the dequeue instead of the trigger, in which
-/// case the run does not exercise the race — it still asserts the invariant.
-#[test]
-#[cfg(not(windows))]
-fn await_reflects_triggered_notes_flush() {
-    let mut mock_api = MockApiServer::start();
-    let metrics_db_dir = tempfile::tempdir().expect("failed to create metrics db dir");
-    let metrics_db_path = metrics_db_dir.path().join("metrics.db");
-    let mut repo = TestRepo::new_with_daemon_env(&[
-        ("GIT_AI_API_BASE_URL", mock_api.base_url()),
-        ("GIT_AI_API_KEY", "test-api-key"),
-        ("GIT_AI_NOTES_BACKEND_KIND", "http"),
-        ("GIT_AI_NOTES_BACKEND_URL", mock_api.base_url()),
-        (
-            "GIT_AI_TEST_METRICS_DB_PATH",
-            metrics_db_path.to_str().unwrap(),
-        ),
-        // The triggered flush holds the dequeued note rows locked for 8s
-        // before uploading — the window `await` must not certify across.
-        ("GIT_AI_TEST_NOTES_UPLOAD_STALL_MS", "8000"),
-    ]);
-    repo.patch_git_ai_config(|patch| {
-        patch.exclude_prompts_in_repositories = Some(vec![]);
-        patch.prompt_storage = Some("default".to_string());
-        patch.telemetry_oss_disabled = Some(true);
-        patch.notes_backend = Some(NotesBackendConfig {
-            kind: NotesBackendKind::Http,
-            backend_url: Some(mock_api.base_url().to_string()),
-        });
-    });
-
-    let repo_root = repo.canonical_path();
-    let file_path = repo_root.join("test.ts");
-    fs::write(&file_path, "const x = 1;\n").expect("failed to write initial file");
-    repo.git_ai(&["checkpoint", "mock_known_human", "test.ts"])
-        .expect("known-human checkpoint should succeed");
-    fs::write(&file_path, "const x = 2;\n").expect("failed to write update");
-    repo.git_ai(&["checkpoint", "mock_ai", "test.ts"])
-        .expect("ai checkpoint should succeed");
-    repo.git(&["add", "-A"]).expect("add should succeed");
-    repo.git(&["commit", "-m", "Commit whose note flush is in flight"])
-        .expect("commit should succeed");
-
-    // Fire the notes.flush trigger from outside the daemon (as production
-    // clients do) until the note row exists and a flush enters its stalled
-    // upload; triggers before the row lands are cheap no-ops (the stall hook
-    // only engages with rows dequeued).
-    let control_socket_path = daemon_control_socket_path(&repo);
-    let started = std::time::Instant::now();
-    loop {
-        let _ = send_control_request(&control_socket_path, &ControlRequest::FlushNotes);
-        if repo
-            .daemon_stderr_contents()
-            .contains("test notes upload stall engaged")
-        {
-            break;
-        }
-        assert!(
-            started.elapsed() < Duration::from_secs(15),
-            "notes upload stall never engaged:\n{}",
-            repo.daemon_stderr_contents()
-        );
-        thread::sleep(Duration::from_millis(100));
-    }
-
-    // Await while the triggered upload is stalled with the note rows locked.
-    let output = repo
-        .git_ai(&["await", "--timeout", "60"])
-        .expect("await should succeed");
-    assert!(
-        output.contains("finished"),
-        "await should report finished: {}",
-        output
-    );
-
-    let requests = mock_api.collect_requests();
-    let notes_requests = requests
-        .iter()
-        .filter(|r| r["path"].as_str() == Some("/worker/notes/upload"))
-        .count();
-    assert!(
-        notes_requests > 0,
-        "await certified while the triggered notes upload was still in flight: got {} notes uploads\ndaemon log:\n{}",
-        notes_requests,
-        repo.daemon_stderr_contents()
-    );
-}
-
-/// The telemetry flush loop runs every 3 seconds, so its skip reasons
-/// ("not authenticated", "backend is not Http", ...) must log at debug, not
-/// INFO — an unauthenticated or default-config daemon would otherwise write
-/// tens of thousands of identical INFO lines per day into its log file.
-#[test]
-fn daemon_flush_skip_reasons_do_not_log_at_info() {
-    // Default test repo: no API key, GitNotes backend — every flush pass
-    // skips both the metrics upload and the notes flush.
-    let repo = TestRepo::new();
-    let control_socket_path = daemon_control_socket_path(&repo);
-
-    // Each trigger runs one serialized flush pass in the telemetry loop.
-    for _ in 0..3 {
-        send_control_request(&control_socket_path, &ControlRequest::FlushNotes)
-            .expect("flush trigger should be accepted");
-        thread::sleep(Duration::from_millis(300));
-    }
-
-    let logs = repo.daemon_stderr_contents();
-    for needle in ["metrics: skipping pending upload", "notes: skipping flush"] {
-        assert!(
-            !logs.contains(needle),
-            "flush skip reason {needle:?} should not appear at the default log level:\n{logs}"
-        );
-    }
 }
 
 /// A control client that connects and vanishes (times out, dies mid-request)

@@ -232,23 +232,6 @@ fn handle_run(args: &[String]) -> Result<(), String> {
         crate::daemon::DaemonExitAction::Restart => {
             ensure_daemon_running(Duration::from_secs(5)).map(|_| ())?;
         }
-        crate::daemon::DaemonExitAction::RestartAfterUpdate => {
-            // Daemon is fully dead (lock released, sockets removed, threads joined).
-            // Now safe to self-update — if the install cannot proceed, bring the
-            // daemon back so a failed update does not leave the service down.
-            match crate::daemon::daemon_run_pending_self_update() {
-                crate::daemon::DaemonSelfUpdateOutcome::Installed => {
-                    #[cfg(not(windows))]
-                    {
-                        ensure_daemon_running(Duration::from_secs(5)).map(|_| ())?;
-                    }
-                }
-                crate::daemon::DaemonSelfUpdateOutcome::NoUpdate
-                | crate::daemon::DaemonSelfUpdateOutcome::Failed => {
-                    ensure_daemon_running(Duration::from_secs(5)).map(|_| ())?;
-                }
-            }
-        }
     }
 
     Ok(())
@@ -645,6 +628,15 @@ fn handle_shutdown(args: &[String]) -> Result<(), String> {
     } else {
         soft_shutdown_daemon(&config)
     }
+}
+
+/// Stop the background service gracefully if it is running (Enkidu's Agent
+/// Git turning off).
+pub(crate) fn stop_daemon_for_enkidu(config: &DaemonConfig) -> Result<(), String> {
+    if !daemon_is_up(config) && !daemon_startup_is_blocked(config) {
+        return Ok(());
+    }
+    stop_daemon(config, GRACEFUL_SHUTDOWN_TIMEOUT)
 }
 
 fn handle_restart(args: &[String]) -> Result<(), String> {

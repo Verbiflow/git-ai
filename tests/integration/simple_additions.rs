@@ -908,7 +908,7 @@ Another AI line
         "Untracked line".unattributed_human(), // 'untracked'
         "Human line".human(),                  // known human
         "AI line".ai(),                        // AI line
-        "Another untracked line".ai(),         // recovered edge line
+        "Another untracked line".human(),      // no adjacency guess (VER-84)
         "Another AI line".ai(),                // AI line
     ]);
 }

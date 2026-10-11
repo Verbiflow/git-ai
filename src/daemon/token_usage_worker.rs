@@ -52,7 +52,7 @@ use tokio::sync::Notify;
 use tokio::time::{MissedTickBehavior, interval};
 
 use crate::authorship::authorship_log_serialization::generate_session_id;
-use crate::daemon::telemetry_worker::DaemonTelemetryWorkerHandle;
+use crate::daemon::local_metrics::LocalMetricsSink;
 use crate::error::GitAiError;
 use crate::metrics::{EventAttributes, MetricEvent, PosEncoded, TokenUsageValues};
 use crate::streams::db::{StreamRecord, StreamsDatabase};
@@ -275,7 +275,7 @@ impl TokenUsageWorkerHandle {
 pub fn spawn_token_usage_worker(
     streams_db: Arc<StreamsDatabase>,
     token_db: Arc<TokenUsageDatabase>,
-    telemetry: DaemonTelemetryWorkerHandle,
+    telemetry: LocalMetricsSink,
     shutdown_notify: Arc<Notify>,
 ) -> TokenUsageWorkerHandle {
     let (notify_tx, notify_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -309,7 +309,7 @@ pub fn spawn_token_usage_worker(
 struct TokenUsageWorker {
     streams_db: Arc<StreamsDatabase>,
     token_db: Arc<TokenUsageDatabase>,
-    telemetry: DaemonTelemetryWorkerHandle,
+    telemetry: LocalMetricsSink,
     shutdown_notify: Arc<Notify>,
     shutdown_flag: Arc<AtomicBool>,
     notify_rx: tokio::sync::mpsc::UnboundedReceiver<TokenUsageTask>,
@@ -860,7 +860,7 @@ fn process_task_blocking(
 /// Hand events to the telemetry queue, waiting out buffer backpressure
 /// (same thresholds as the stream worker).
 fn persist_events(
-    telemetry: &DaemonTelemetryWorkerHandle,
+    telemetry: &LocalMetricsSink,
     shutdown_flag: &AtomicBool,
     events: &[MetricEvent],
 ) -> Result<(), GitAiError> {
@@ -2483,7 +2483,7 @@ mod tests {
         let mut worker = TokenUsageWorker {
             streams_db,
             token_db: token_db.clone(),
-            telemetry: DaemonTelemetryWorkerHandle::new_noop(),
+            telemetry: LocalMetricsSink::new_noop(),
             shutdown_notify: Arc::new(Notify::new()),
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             notify_rx,
@@ -2665,7 +2665,7 @@ mod tests {
         TokenUsageWorker {
             streams_db,
             token_db,
-            telemetry: DaemonTelemetryWorkerHandle::new_noop(),
+            telemetry: LocalMetricsSink::new_noop(),
             shutdown_notify: Arc::new(Notify::new()),
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             notify_rx,
@@ -3190,7 +3190,7 @@ mod tests {
         let worker = TokenUsageWorker {
             streams_db,
             token_db,
-            telemetry: DaemonTelemetryWorkerHandle::new_noop(),
+            telemetry: LocalMetricsSink::new_noop(),
             shutdown_notify: shutdown_notify.clone(),
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             notify_rx,

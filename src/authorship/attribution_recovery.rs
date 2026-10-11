@@ -19,7 +19,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const BASH_RECOVERY_WINDOW_NS: u128 = 3_000_000_000;
 const BASH_RECOVERY_COARSE_TIMESTAMP_NS: u128 = 1_000_000_000;
 pub(crate) const SESSION_EVENT_RECOVERY_WINDOW_NS: u128 = 3_000_000_000;
-const EDGE_EXTENSION_MAX_LINES: usize = 3;
 const NS_PER_SECOND: u128 = 1_000_000_000;
 
 const CODEX_TOOLS: &[&str] = &["codex", "codex-cloud"];
@@ -226,13 +225,10 @@ pub(crate) fn recover_attribution(
         context.file_timestamps,
     )?;
 
-    recover_adjacent_edges(
-        repo,
-        parent_sha,
-        commit_sha,
-        authorship_log,
-        committed_hunks,
-    );
+    // Upstream also credited unknown lines next to an agent's lines to that
+    // agent here. That is a guess, and it hands an unhooked writer's lines to
+    // whichever agent edited beside them (VER-84), so this fork leaves them
+    // unknown unless the evidence-based passes below explain them.
     let unknown_after_edges = unknown_lines_by_file(authorship_log, committed_hunks);
     if unknown_after_edges.is_empty() {
         return Ok(());
@@ -1286,81 +1282,6 @@ fn agent_kind_matches_tool(kind: &CommitAgentKind, tool: &str) -> bool {
         .any(|candidate| candidate.eq_ignore_ascii_case(tool))
 }
 
-fn recover_adjacent_edges(
-    repo: &Repository,
-    parent_sha: &str,
-    commit_sha: &str,
-    authorship_log: &mut AuthorshipLog,
-    committed_hunks: &HashMap<String, Vec<LineRange>>,
-) {
-    let unknown = unknown_lines_by_file(authorship_log, committed_hunks);
-    for (file_path, unknown_lines) in unknown {
-        let line_to_author = line_author_map(authorship_log, &file_path);
-        let runs = contiguous_runs(&unknown_lines);
-        for run in runs {
-            let Some(recovery) = edge_recovery_for_run(&line_to_author, &run) else {
-                continue;
-            };
-            let trace_id = generate_trace_id();
-            let source_session = recovery
-                .source_author
-                .split("::")
-                .next()
-                .unwrap_or(&recovery.source_author)
-                .to_string();
-            let (tool, model, external_session_id) = authorship_log
-                .metadata
-                .sessions
-                .get(&source_session)
-                .map(|session| {
-                    (
-                        session.agent_id.tool.clone(),
-                        session.agent_id.model.clone(),
-                        session.agent_id.id.clone(),
-                    )
-                })
-                .unwrap_or_default();
-            let recovered_author = if source_session.starts_with("s_") {
-                format!("{}::{}", source_session, trace_id)
-            } else {
-                recovery.source_author.clone()
-            };
-            let recovered_line_count = recovery.lines.len() as u32;
-            add_attestation(
-                authorship_log,
-                &file_path,
-                &recovered_author,
-                &recovery.lines,
-            );
-
-            let metadata = json!({
-                "solver": "edge_extension",
-                "file_path": file_path,
-                "source_author": &recovery.source_author,
-                "recovered_lines": &recovery.lines,
-            });
-            record_recovery_metric(RecoveryMetricInput {
-                repo,
-                parent_sha,
-                commit_sha,
-                file_path: &file_path,
-                author_id: &recovered_author,
-                session_id: &source_session,
-                trace_id: &trace_id,
-                tool: &tool,
-                model: &model,
-                external_session_id: &external_session_id,
-                external_tool_use_id: None,
-                edit_kind: "attribution_recovery_edge",
-                checkpoint_type: "recovered_edge_extension",
-                recovered_line_count,
-                metadata,
-                event_ts: None,
-            });
-        }
-    }
-}
-
 fn repo_worktree_key(repo: &Repository) -> Result<String, GitAiError> {
     let workdir = repo.workdir()?;
     let normalized = worktree_root_for_path(&workdir).unwrap_or(workdir);
@@ -1724,105 +1645,6 @@ fn covered_lines_by_file(authorship_log: &AuthorshipLog) -> HashMap<String, Hash
         }
     }
     covered
-}
-
-fn line_author_map(authorship_log: &AuthorshipLog, file_path: &str) -> BTreeMap<u32, String> {
-    let mut map = BTreeMap::new();
-    let Some(file_attestation) = authorship_log
-        .attestations
-        .iter()
-        .find(|att| att.file_path == file_path)
-    else {
-        return map;
-    };
-    for entry in &file_attestation.entries {
-        for line in entry.line_ranges.iter().flat_map(LineRange::expand) {
-            map.insert(line, entry.hash.clone());
-        }
-    }
-    map
-}
-
-fn contiguous_runs(lines: &[u32]) -> Vec<Vec<u32>> {
-    if lines.is_empty() {
-        return Vec::new();
-    }
-    let mut sorted = lines.to_vec();
-    sorted.sort_unstable();
-    sorted.dedup();
-
-    let mut runs: Vec<Vec<u32>> = Vec::new();
-    let mut current = vec![sorted[0]];
-    for line in sorted.into_iter().skip(1) {
-        if line == current.last().copied().unwrap_or(line) + 1 {
-            current.push(line);
-        } else {
-            runs.push(current);
-            current = vec![line];
-        }
-    }
-    runs.push(current);
-    runs
-}
-
-struct EdgeRecovery {
-    source_author: String,
-    lines: Vec<u32>,
-}
-
-fn edge_recovery_for_run(
-    line_to_author: &BTreeMap<u32, String>,
-    run: &[u32],
-) -> Option<EdgeRecovery> {
-    let first = *run.first()?;
-    let last = *run.last()?;
-    let prev = first
-        .checked_sub(1)
-        .and_then(|line| line_to_author.get(&line));
-    let next = line_to_author.get(&(last + 1));
-
-    match (prev, next) {
-        (Some(left), Some(right))
-            if is_ai_attestation(left)
-                && is_ai_attestation(right)
-                && ai_session_key(left) == ai_session_key(right) =>
-        {
-            let mut lines = run
-                .iter()
-                .take(EDGE_EXTENSION_MAX_LINES)
-                .copied()
-                .collect::<Vec<_>>();
-            lines.extend(run.iter().rev().take(EDGE_EXTENSION_MAX_LINES).copied());
-            lines.sort_unstable();
-            lines.dedup();
-            Some(EdgeRecovery {
-                source_author: left.clone(),
-                lines,
-            })
-        }
-        (Some(left), None) if is_ai_attestation(left) => Some(EdgeRecovery {
-            source_author: left.clone(),
-            lines: run.iter().take(EDGE_EXTENSION_MAX_LINES).copied().collect(),
-        }),
-        (None, Some(right)) if is_ai_attestation(right) => Some(EdgeRecovery {
-            source_author: right.clone(),
-            lines: run
-                .iter()
-                .rev()
-                .take(EDGE_EXTENSION_MAX_LINES)
-                .copied()
-                .collect(),
-        }),
-        _ => None,
-    }
-}
-
-#[cfg(test)]
-fn edge_recovered_lines(line_to_author: &BTreeMap<u32, String>, run: &[u32]) -> Option<Vec<u32>> {
-    edge_recovery_for_run(line_to_author, run).map(|mut recovery| {
-        recovery.lines.sort_unstable();
-        recovery.lines
-    })
 }
 
 fn is_ai_attestation(author: &str) -> bool {
@@ -2544,54 +2366,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn edge_recovery_extends_one_sided_runs_and_bridges_matching_ai_neighbors() {
-        let map = BTreeMap::from([
-            (1, "s_a::t_1".to_string()),
-            (3, "s_a::t_2".to_string()),
-            (10, "s_a::t_3".to_string()),
-            (20, "s_b::t_1".to_string()),
-        ]);
-
-        assert_eq!(
-            edge_recovered_lines(&map, &[2]).as_deref(),
-            Some(&[2][..]),
-            "different trace ids for the same session should extend by session"
-        );
-        assert_eq!(
-            edge_recovered_lines(&map, &[4, 5, 6, 7, 8, 9]).as_deref(),
-            Some(&[4, 5, 6, 7, 8, 9][..]),
-            "matching AI neighbors should recover up to three lines from each side"
-        );
-        assert_eq!(
-            edge_recovered_lines(&map, &[11, 12, 13, 14]).as_deref(),
-            Some(&[11, 12, 13][..]),
-            "trailing edge extension should recover at most three lines"
-        );
-        assert_eq!(
-            edge_recovered_lines(&map, &[16, 17, 18, 19]).as_deref(),
-            Some(&[17, 18, 19][..]),
-            "leading edge extension should recover the three lines nearest the AI block"
-        );
-    }
-
-    #[test]
-    fn edge_recovery_keeps_human_and_different_session_guardrails() {
-        let map = BTreeMap::from([
-            (1, "s_a::t_1".to_string()),
-            (3, "s_b::t_1".to_string()),
-            (5, "h_human::t_1".to_string()),
-        ]);
-
-        assert_eq!(
-            edge_recovered_lines(&map, &[2]).as_deref(),
-            None,
-            "different sessions must not be bridged"
-        );
-        assert_eq!(
-            edge_recovered_lines(&map, &[4]).as_deref(),
-            None,
-            "known-human neighbors must not be used for edge extension"
-        );
-    }
 }

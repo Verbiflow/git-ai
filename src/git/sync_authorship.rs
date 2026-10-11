@@ -136,28 +136,6 @@ pub fn fetch_missing_notes_for_commits(
         return Ok(());
     }
 
-    // On the HTTP notes backend the server — not refs/notes/ai — is the
-    // source of truth: pull the missing source notes straight from it into
-    // the local cache first. The git refs fetch below requires working SSH
-    // auth in the daemon's environment and only helps repos whose notes live
-    // in refs; rewrites were stranding notes whenever that fetch failed
-    // (e.g. `Permission denied (publickey)`) even though the backend held
-    // every source note.
-    if crate::config::Config::fresh().notes_backend_enabled() {
-        let missing_owned: Vec<String> = missing.iter().map(|sha| sha.to_string()).collect();
-        match crate::git::notes_api::warm_cache_for_commits(&missing_owned) {
-            Ok(cached) => {
-                let cached: HashSet<String> = cached.into_iter().collect();
-                if missing_owned.iter().all(|sha| cached.contains(sha)) {
-                    return Ok(());
-                }
-            }
-            Err(e) => {
-                tracing::debug!("HTTP backend fetch for missing source notes failed: {}", e);
-            }
-        }
-    }
-
     tracing::debug!(
         "Source commits missing notes: {:?}, trying to fetch from remotes",
         missing
@@ -331,13 +309,6 @@ const PUSH_NOTES_MAX_ATTEMPTS: usize = 3;
 
 // for use with post-push hook
 pub fn push_authorship_notes(repository: &Repository, remote_name: &str) -> Result<(), GitAiError> {
-    // Belt-and-suspenders: when the HTTP backend is active, notes are not stored
-    // in refs/notes/ai so there is nothing to push.
-    if crate::config::Config::get().notes_backend_kind() == crate::config::NotesBackendKind::Http {
-        tracing::debug!("push_authorship_notes: skipping refs/notes/ai push (Http backend active)");
-        return Ok(());
-    }
-
     let mut last_error = None;
 
     for attempt in 0..PUSH_NOTES_MAX_ATTEMPTS {
@@ -543,62 +514,6 @@ mod tests {
             std::env::remove_var("GIT_AI_NOTES_BACKEND_URL");
             std::env::remove_var("GIT_AI_API_KEY");
         }
-    }
-
-    /// Regression: a rewrite's missing source notes must be fetched from the
-    /// HTTP notes backend when the git refs fetch cannot succeed (e.g. the
-    /// daemon's environment has no SSH auth to the remote). This path was
-    /// previously refs-fetch-only, so rebases/restacks stranded authorship
-    /// notes with `failed to fetch authorship notes for source commits`
-    /// even though the backend held every source note.
-    #[test]
-    #[serial_test::serial(notes_db_env)]
-    fn fetch_missing_notes_pulls_sources_from_http_backend_when_refs_fetch_fails() {
-        use crate::git::test_utils::TmpRepo;
-        use tempfile::NamedTempFile;
-
-        let tmp_db = NamedTempFile::new().expect("tmp notes-db");
-
-        let repo = TmpRepo::new().expect("TmpRepo::new");
-        repo.write_file("src.txt", "content", false).expect("write");
-        let sha = repo.commit_all("source commit").expect("commit");
-
-        // A remote whose fetch always fails, standing in for broken SSH auth.
-        repo.git_command(&["remote", "add", "origin", "/nonexistent/git-ai-test-remote"])
-            .expect("remote add");
-
-        // The backend holds the note the local cache and refs are missing.
-        let mut server = mockito::Server::new();
-        let notes_json =
-            serde_json::json!({ "notes": { sha.clone(): "server-note-content" } }).to_string();
-        let _mock = server
-            .mock(
-                "GET",
-                mockito::Matcher::Regex(r"^/worker/notes/".to_string()),
-            )
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(&notes_json)
-            .create();
-
-        set_http_backend_env(tmp_db.path().to_str().unwrap(), &server.url());
-
-        let result = fetch_missing_notes_for_commits(repo.gitai_repo(), std::slice::from_ref(&sha));
-
-        // The note must now be in the local cache as an already-synced row.
-        let cached = {
-            let db = crate::notes::db::NotesDatabase::global().expect("global db");
-            let lock = db.lock().expect("lock");
-            lock.get_note(&sha).expect("get_note")
-        };
-        clear_http_backend_env();
-
-        assert!(
-            result.is_ok(),
-            "fetch_missing_notes_for_commits should succeed via the HTTP backend: {:?}",
-            result
-        );
-        assert_eq!(cached, Some("server-note-content".to_string()));
     }
 
     /// The error contract is preserved: when neither the HTTP backend nor
