@@ -103,28 +103,57 @@ pub fn reset_timeout_overrides_for_test() {
 }
 
 // ---------------------------------------------------------------------------
-// Embedded (in-process) bash session store
+// Embedded (daemon-free) bash session store
 // ---------------------------------------------------------------------------
 
-/// When set, bash pre-snapshots live in this process instead of the git-ai
-/// daemon. For hosts that embed git-ai as a library in one long-lived process
-/// and never run the daemon (Enkidu's Agent Git): the pre and post hooks of a
-/// tool call are both handled by that process, so it can hold the snapshot.
-static EMBEDDED_BASH_SESSIONS: std::sync::OnceLock<
-    std::sync::Mutex<crate::daemon::bash_sessions::BashSessionState>,
-> = std::sync::OnceLock::new();
+/// When set, bash pre-snapshots are kept as files in this directory instead of
+/// in the git-ai daemon. For hosts that embed git-ai as a library and never run
+/// the daemon (Enkidu's Agent Git): each hook is its own short-lived process,
+/// so the pre hook writes the snapshot and the post hook reads and removes it.
+static EMBEDDED_BASH_SESSIONS_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
-/// Keep bash pre-snapshots in-process for the rest of this process's life.
-/// Idempotent.
-pub fn enable_embedded_bash_sessions() {
-    EMBEDDED_BASH_SESSIONS.get_or_init(Default::default);
+/// Keep bash pre-snapshots under `dir` for the rest of this process's life.
+/// The first call wins.
+pub fn enable_embedded_bash_sessions(dir: PathBuf) {
+    let _ = EMBEDDED_BASH_SESSIONS_DIR.set(dir);
 }
 
-fn embedded_bash_sessions()
--> Option<std::sync::MutexGuard<'static, crate::daemon::bash_sessions::BashSessionState>> {
-    EMBEDDED_BASH_SESSIONS
-        .get()
-        .map(|m| m.lock().unwrap_or_else(|poisoned| poisoned.into_inner()))
+/// Snapshots older than this belong to a tool call whose post hook never ran.
+const EMBEDDED_SESSION_STALE: Duration = Duration::from_secs(300);
+
+fn embedded_snapshot_path(dir: &Path, session_id: &str, tool_use_id: &str) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    let key = Sha256::digest(format!("{session_id}\0{tool_use_id}").as_bytes());
+    dir.join(format!("{key:x}.json"))
+}
+
+fn embedded_store_snapshot(
+    dir: &Path,
+    session_id: &str,
+    tool_use_id: &str,
+    snap: &StatSnapshot,
+) -> Result<(), GitAiError> {
+    fs::create_dir_all(dir)?;
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let stale = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age > EMBEDDED_SESSION_STALE);
+            if stale {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+    let path = embedded_snapshot_path(dir, session_id, tool_use_id);
+    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+    let bytes = serde_json::to_vec(snap)
+        .map_err(|e| GitAiError::Generic(format!("serialize bash snapshot: {e}")))?;
+    fs::write(&tmp, bytes)?;
+    fs::rename(&tmp, &path)?;
+    Ok(())
 }
 
 /// Resolve the daemon control socket path, preferring the thread-local test
@@ -909,8 +938,9 @@ fn query_daemon_watermarks(repo_working_dir: &str) -> Option<DaemonWatermarks> {
 /// Returns `None` if the daemon is not running, the session is not found,
 /// or any communication error occurs.
 fn query_daemon_bash_snapshot(session_id: &str, tool_use_id: &str) -> Option<StatSnapshot> {
-    if let Some(sessions) = embedded_bash_sessions() {
-        return sessions.get_snapshot(session_id, tool_use_id).cloned();
+    if let Some(dir) = EMBEDDED_BASH_SESSIONS_DIR.get() {
+        let bytes = fs::read(embedded_snapshot_path(dir, session_id, tool_use_id)).ok()?;
+        return serde_json::from_slice(&bytes).ok();
     }
     let socket = effective_daemon_socket()?;
     if !socket.exists() {
@@ -1033,8 +1063,12 @@ struct BashSessionEndSignal<'a> {
 
 /// Signal the daemon that a bash session has ended.
 fn signal_daemon_bash_session_end(signal: BashSessionEndSignal<'_>) {
-    if let Some(mut sessions) = embedded_bash_sessions() {
-        sessions.end_session(signal.session_id, signal.tool_use_id);
+    if let Some(dir) = EMBEDDED_BASH_SESSIONS_DIR.get() {
+        let _ = fs::remove_file(embedded_snapshot_path(
+            dir,
+            signal.session_id,
+            signal.tool_use_id,
+        ));
         return;
     }
     let Some(socket) = effective_daemon_socket() else {
@@ -1127,18 +1161,8 @@ pub fn handle_bash_pre_tool_use_with_context_and_cwd(
         snap.entries.keys().map(|rel| repo_root.join(rel)).collect()
     };
 
-    if let Some(mut sessions) = embedded_bash_sessions() {
-        sessions.start_session(crate::daemon::bash_sessions::BashSessionStart {
-            session_id: context.session_id.to_string(),
-            tool_use_id: context.tool_use_id.to_string(),
-            repo_work_dir: repo_working_dir,
-            agent_id: context.agent_id.clone(),
-            metadata: context.agent_metadata.cloned().unwrap_or_default(),
-            stat_snapshot: snap,
-            start_trace_id: context.trace_id.to_string(),
-            started_at_ns,
-            command: context.command.map(ToString::to_string),
-        });
+    if let Some(dir) = EMBEDDED_BASH_SESSIONS_DIR.get() {
+        embedded_store_snapshot(dir, context.session_id, context.tool_use_id, &snap)?;
         return Ok(BashPreHookResult { dirty_paths });
     }
 

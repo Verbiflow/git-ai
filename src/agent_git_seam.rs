@@ -26,10 +26,18 @@ use crate::error::GitAiError;
 /// No background daemon, no sockets, no sqlite, no network. The only external
 /// process used is the `git` binary git-ai shells out to for repo discovery and
 /// diffing.
-pub fn checkpoint_from_hook(preset: &str, hook_input: &str) -> Result<usize, GitAiError> {
-    // Bash tool calls: hold the pre-snapshot in this process (the daemon that
-    // normally holds it never runs here), so the post hook can diff against it.
-    crate::commands::checkpoint_agent::bash_tool::enable_embedded_bash_sessions();
+///
+/// `state_dir` holds Bash tool pre-snapshots between a tool call's pre and post
+/// hooks (the daemon that normally holds them never runs here), so files an
+/// agent changes through shell commands are credited to it.
+pub fn checkpoint_from_hook(
+    preset: &str,
+    hook_input: &str,
+    state_dir: &std::path::Path,
+) -> Result<usize, GitAiError> {
+    crate::commands::checkpoint_agent::bash_tool::enable_embedded_bash_sessions(
+        state_dir.to_path_buf(),
+    );
     let requests = execute_preset_checkpoint(preset, hook_input)?;
     let applied = requests.len();
     for request in requests {
