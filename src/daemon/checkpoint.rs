@@ -10,6 +10,7 @@ use crate::authorship::imara_diff_utils::{
 use crate::authorship::working_log::CheckpointKind;
 use crate::authorship::working_log::{Checkpoint, WorkingLogEntry};
 use crate::commands::checkpoint_agent::orchestrator::CheckpointRequest;
+use crate::commands::checkpoint_agent::tool_claims::{ToolClaim, apply_claim};
 use crate::error::GitAiError;
 use crate::git::repo_storage::PersistedWorkingLog;
 use crate::git::repository::Repository;
@@ -264,6 +265,19 @@ pub fn execute_resolved_checkpoint_from_daemon(
     checkpoint_request: CheckpointRequest,
     resolved: ResolvedCheckpointExecution,
 ) -> Result<(), GitAiError> {
+    execute_resolved_checkpoint_with_claim(repo, author, kind, checkpoint_request, resolved, None)
+}
+
+/// [`execute_resolved_checkpoint_from_daemon`] for an AI checkpoint scoped to
+/// what its tool call wrote (see `tool_claims`).
+pub fn execute_resolved_checkpoint_with_claim(
+    repo: &Repository,
+    author: &str,
+    kind: CheckpointKind,
+    checkpoint_request: CheckpointRequest,
+    resolved: ResolvedCheckpointExecution,
+    claim: Option<&ToolClaim>,
+) -> Result<(), GitAiError> {
     let checkpoint_start = Instant::now();
     tracing::debug!("[BENCHMARK] Starting daemon replay checkpoint");
     execute_resolved_checkpoint(
@@ -274,6 +288,7 @@ pub fn execute_resolved_checkpoint_from_daemon(
         checkpoint_request,
         resolved,
         checkpoint_start,
+        claim,
     )
     .map(|_| ())
 }
@@ -286,6 +301,7 @@ fn execute_resolved_checkpoint(
     checkpoint_request: CheckpointRequest,
     mut resolved: ResolvedCheckpointExecution,
     checkpoint_start: Instant,
+    claim: Option<&ToolClaim>,
 ) -> Result<(usize, usize, usize), GitAiError> {
     if kind.is_ai() && checkpoint_request.agent_id.is_none() {
         return Err(GitAiError::Generic(
@@ -372,6 +388,9 @@ fn execute_resolved_checkpoint(
         resolved.ts,
         Some(resolved.base_commit.as_str()),
         trace_id.clone(),
+        claim
+            .filter(|claim| kind.is_ai() && claim.is_active())
+            .cloned(),
     ))?;
     tracing::debug!(
         "[BENCHMARK] get_checkpoint_entries generated {} entries, took {:?}",
@@ -677,6 +696,7 @@ fn get_checkpoint_entry_for_file(
     initial_snapshot_contents: Arc<HashMap<String, Arc<str>>>,
     parent_note_attributions: Arc<HashMap<String, Vec<LineAttribution>>>,
     ts: u128,
+    claim: Option<Arc<ToolClaim>>,
 ) -> Result<Option<(WorkingLogEntry, FileLineStats)>, GitAiError> {
     // Deterministic blocking work for the TestRepo throughput guard; release builds omit it.
     #[cfg(feature = "test-support")]
@@ -699,6 +719,28 @@ fn get_checkpoint_entry_for_file(
     let current_content = working_log
         .read_current_file_content(&file_path)
         .unwrap_or_else(|_| Arc::<str>::from(""));
+
+    // The file when the claiming tool call started: its blob in the baseline,
+    // or the base commit's version when the baseline had no entry for it.
+    let baseline_content: Option<Arc<str>> = claim.as_ref().and_then(|claim| {
+        let baseline = claim.baseline.as_ref()?;
+        Some(match baseline.blobs.get(&file_path) {
+            Some(sha) => Arc::<str>::from(working_log.get_file_version(sha).ok()?),
+            None => get_previous_content_from_head(&repo, &file_path, head_tree_id.as_ref()),
+        })
+    });
+    let scope = |attributions: &[Attribution], previous: &str| {
+        let claim = claim.as_ref()?;
+        apply_claim(
+            attributions,
+            previous,
+            &current_content,
+            baseline_content.as_deref(),
+            claim.written.as_deref(),
+            author_id.as_str(),
+            ts,
+        )
+    };
 
     // Non-pre-commit fast path:
     // Preserve existing `git-ai checkpoint` behavior for human-only files by writing an
@@ -840,8 +882,24 @@ fn get_checkpoint_entry_for_file(
     // For files from previous checkpoints, check if content has changed
     if is_from_checkpoint && content_eq_ignoring_line_endings(&current_content, &previous_content) {
         if current_content == previous_content {
-            // Byte-identical — truly no change.
-            return Ok(None);
+            // Byte-identical — no change since the last checkpoint. A claim can
+            // still take back lines another hook filed as human in between.
+            let Some(attributions) = scope(&prev_attributions, &previous_content) else {
+                return Ok(None);
+            };
+            let line_attributions =
+                crate::authorship::attribution_tracker::attributions_to_line_attributions_for_checkpoint(
+                    &attributions,
+                    &current_content,
+                    true,
+                );
+            let entry = WorkingLogEntry::new(
+                file_path,
+                file_content_hash,
+                attributions,
+                line_attributions,
+            );
+            return Ok(Some((entry, FileLineStats::default())));
         }
         // Content differs only in line endings (CRLF ↔ LF). Update the stored blob
         // to the current content so future diffs compare LF-vs-LF. Without this,
@@ -869,7 +927,7 @@ fn get_checkpoint_entry_for_file(
         return Ok(Some((entry, FileLineStats::default())));
     }
 
-    let (entry, stats) = make_entry_for_file(FileEntryInput {
+    let (mut entry, stats) = make_entry_for_file(FileEntryInput {
         file_path: &file_path,
         blob_sha: &file_content_hash,
         author_id: author_id.as_ref(),
@@ -879,6 +937,15 @@ fn get_checkpoint_entry_for_file(
         content: &current_content,
         ts,
     })?;
+    if let Some(attributions) = scope(&entry.attributions, &previous_content) {
+        entry.line_attributions =
+            crate::authorship::attribution_tracker::attributions_to_line_attributions_for_checkpoint(
+                &attributions,
+                &current_content,
+                true,
+            );
+        entry.attributions = attributions;
+    }
 
     tracing::debug!(
         "[BENCHMARK] Processing file {} took {:?}",
@@ -901,6 +968,7 @@ async fn get_checkpoint_entries(
     ts: u128,
     head_commit_override: Option<&str>,
     trace_id: String,
+    claim: Option<ToolClaim>,
 ) -> Result<(Vec<WorkingLogEntry>, Vec<FileLineStats>), GitAiError> {
     let entries_fn_start = Instant::now();
 
@@ -968,6 +1036,19 @@ async fn get_checkpoint_entries(
 
     let parent_note_attributions: HashMap<String, Vec<LineAttribution>> = HashMap::new();
 
+    // A baseline recorded against another base commit (a commit landed during
+    // the tool call) says nothing about this working log.
+    let claim = claim.map(|mut claim| {
+        if claim
+            .baseline
+            .as_ref()
+            .is_some_and(|b| Some(b.base_commit.as_str()) != head_commit_override)
+        {
+            claim.baseline = None;
+        }
+        Arc::new(claim)
+    });
+
     const MAX_CONCURRENT: usize = 30;
 
     // Create a semaphore to limit concurrent tasks
@@ -1001,6 +1082,7 @@ async fn get_checkpoint_entries(
         let initial_attributions = Arc::clone(&initial_attributions);
         let initial_snapshot_contents = Arc::clone(&initial_snapshot_contents);
         let parent_note_attributions = Arc::clone(&parent_note_attributions);
+        let claim = claim.clone();
         let semaphore = Arc::clone(&semaphore);
 
         let task = async move {
@@ -1024,6 +1106,7 @@ async fn get_checkpoint_entries(
                     initial_snapshot_contents.clone(),
                     parent_note_attributions.clone(),
                     ts,
+                    claim,
                 )
             })
             .await

@@ -1058,7 +1058,16 @@ fn wait_at_checkpoint_test_barrier(trace_id: &str) -> Result<(), GitAiError> {
     )))
 }
 
-pub fn apply_checkpoint_side_effect(mut request: CheckpointRequest) -> Result<(), GitAiError> {
+pub fn apply_checkpoint_side_effect(request: CheckpointRequest) -> Result<(), GitAiError> {
+    apply_checkpoint_side_effect_with_claim(request, None)
+}
+
+/// [`apply_checkpoint_side_effect`] for an AI checkpoint scoped by `claim` to
+/// what its tool call wrote (see `checkpoint_agent::tool_claims`).
+pub fn apply_checkpoint_side_effect_with_claim(
+    mut request: CheckpointRequest,
+    claim: Option<&crate::commands::checkpoint_agent::tool_claims::ToolClaim>,
+) -> Result<(), GitAiError> {
     #[cfg(feature = "test-support")]
     {
         wait_at_checkpoint_test_barrier(&request.trace_id)?;
@@ -1118,12 +1127,13 @@ pub fn apply_checkpoint_side_effect(mut request: CheckpointRequest) -> Result<()
         return Ok(());
     };
 
-    crate::daemon::checkpoint::execute_resolved_checkpoint_from_daemon(
+    crate::daemon::checkpoint::execute_resolved_checkpoint_with_claim(
         &repo,
         &author,
         request.checkpoint_kind,
         request,
         resolved,
+        claim,
     )
 }
 

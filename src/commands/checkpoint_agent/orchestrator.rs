@@ -298,7 +298,7 @@ fn cleanup_old_debug_logs(log_dir: &Path) {
     }
 }
 
-fn execute_event(
+pub fn execute_event(
     event: ParsedHookEvent,
     preset_name: &str,
 ) -> Result<Vec<CheckpointRequest>, GitAiError> {
