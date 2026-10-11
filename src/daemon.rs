@@ -1055,16 +1055,31 @@ fn wait_at_checkpoint_test_barrier(trace_id: &str) -> Result<(), GitAiError> {
     )))
 }
 
-pub fn apply_checkpoint_side_effect(request: CheckpointRequest) -> Result<(), GitAiError> {
-    apply_checkpoint_side_effect_with_claim(request, None)
-}
+/// Apply one checkpoint request. A request that belongs to an agent tool call
+/// (`tool_call`, VER-84) also records the call's baseline after a pre hook's
+/// checkpoint, and scopes a post hook's checkpoint to what the call wrote (see
+/// `checkpoint_agent::tool_claims`).
+pub fn apply_checkpoint_side_effect(mut request: CheckpointRequest) -> Result<(), GitAiError> {
+    use crate::commands::checkpoint_agent::tool_claims::{self, ToolClaim};
 
-/// [`apply_checkpoint_side_effect`] for an AI checkpoint scoped by `claim` to
-/// what its tool call wrote (see `checkpoint_agent::tool_claims`).
-pub fn apply_checkpoint_side_effect_with_claim(
-    mut request: CheckpointRequest,
-    claim: Option<&crate::commands::checkpoint_agent::tool_claims::ToolClaim>,
-) -> Result<(), GitAiError> {
+    let marker = request.tool_call.take();
+    let record_baseline = |repo: &crate::git::repository::Repository| {
+        if let Some(marker) = marker.as_ref().filter(|marker| marker.is_pre)
+            && let Err(error) =
+                tool_claims::record_baseline(repo, &marker.session_id, &marker.tool_use_id)
+        {
+            tracing::debug!(%error, tool_use_id = %marker.tool_use_id, "no tool-call baseline");
+        }
+    };
+    if request.files.is_empty() {
+        if let Some(marker) = marker.as_ref().filter(|marker| marker.is_pre)
+            && let Ok(repo) = discover_repository_in_path_no_git_exec(&marker.repo_work_dir)
+        {
+            record_baseline(&repo);
+        }
+        return Ok(());
+    }
+
     #[cfg(feature = "test-support")]
     {
         wait_at_checkpoint_test_barrier(&request.trace_id)?;
@@ -1081,10 +1096,6 @@ pub fn apply_checkpoint_side_effect_with_claim(
                 "synthetic checkpoint processing failure".to_string(),
             ));
         }
-    }
-
-    if request.files.is_empty() {
-        return Ok(());
     }
 
     if request.checkpoint_kind.is_ai()
@@ -1119,19 +1130,30 @@ pub fn apply_checkpoint_side_effect_with_claim(
         crate::metrics::record(values, attrs);
     }
 
+    let claim = marker
+        .as_ref()
+        .filter(|marker| !marker.is_pre)
+        .map(|marker| ToolClaim {
+            written: marker.written.clone(),
+            baseline: tool_claims::take_baseline(&repo, &marker.session_id, &marker.tool_use_id),
+        });
+
     let resolved = resolve_checkpoint_request(&repo, &mut request)?;
     let Some(resolved) = resolved else {
+        record_baseline(&repo);
         return Ok(());
     };
 
-    crate::daemon::checkpoint::execute_resolved_checkpoint_with_claim(
+    let result = crate::daemon::checkpoint::execute_resolved_checkpoint_with_claim(
         &repo,
         &author,
         request.checkpoint_kind,
         request,
         resolved,
-        claim,
-    )
+        claim.as_ref(),
+    );
+    record_baseline(&repo);
+    result
 }
 
 fn resolve_checkpoint_request(
@@ -4926,7 +4948,13 @@ impl ActorDaemonCoordinator {
         }
         let trace_id = request.trace_id.clone();
         let file_count = request.files.len();
-        let Some(repo_work_dir) = request.files.first().map(|file| file.repo_work_dir.clone())
+        // A pre hook with nothing to checkpoint still sends its tool-call
+        // marker, so the call's baseline is recorded in order with its repo.
+        let Some(repo_work_dir) = request
+            .files
+            .first()
+            .map(|file| file.repo_work_dir.clone())
+            .or_else(|| request.tool_call.as_ref().map(|m| m.repo_work_dir.clone()))
         else {
             return Err(GitAiError::Generic(
                 "accepted checkpoint contains no files".to_string(),
@@ -6307,7 +6335,9 @@ impl ActorDaemonCoordinator {
                     let repo_wd = request
                         .files
                         .first()
-                        .map(|f| f.repo_work_dir.to_string_lossy().to_string())
+                        .map(|f| f.repo_work_dir.clone())
+                        .or_else(|| request.tool_call.as_ref().map(|m| m.repo_work_dir.clone()))
+                        .map(|dir| dir.to_string_lossy().to_string())
                         .unwrap_or_default();
                     let checkpoint_file_paths: Vec<String> = request
                         .files

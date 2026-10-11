@@ -5,9 +5,8 @@
 //! telemetry. This module exposes the one checkpoint entry point Enkidu needs,
 //! composed from already-daemon-free internals:
 //!
-//! 1. The agent's preset parses the hook payload into events, and
-//!    `commands::checkpoint_agent::orchestrator::execute_event` turns each
-//!    into `CheckpointRequest`s (pure).
+//! 1. `commands::checkpoint_agent::orchestrator::execute_preset_checkpoint`
+//!    parses an agent hook payload into `CheckpointRequest`s (pure).
 //! 2. `daemon::apply_checkpoint_side_effect` discovers the repo, resolves, and
 //!    appends to `.git/ai/working_logs/<HEAD sha>/checkpoints.jsonl`. Despite
 //!    the module name it performs no IPC; the metrics calls on this path are a
@@ -17,10 +16,7 @@
 //! Commit → `refs/notes/ai` is served by the already-`pub`
 //! `authorship::post_commit::post_commit`; no patch is needed for it.
 
-use crate::authorship::authorship_log_serialization::generate_trace_id;
-use crate::commands::checkpoint_agent::orchestrator::execute_event;
-use crate::commands::checkpoint_agent::presets::{ParsedHookEvent, resolve_preset};
-use crate::commands::checkpoint_agent::tool_claims::{self, ToolClaim};
+use crate::commands::checkpoint_agent::orchestrator::execute_preset_checkpoint;
 use crate::error::GitAiError;
 use std::path::Path;
 
@@ -32,11 +28,10 @@ use std::path::Path;
 /// process used is the `git` binary git-ai shells out to for repo discovery and
 /// diffing.
 ///
-/// `state_dir` holds what a tool call's pre hook leaves for its post hook (the
-/// daemon that normally holds it never runs here): the Bash tool's stat
-/// snapshot, so files an agent changes through shell commands are credited to
-/// it, and every call's baseline, so its post checkpoint credits only the
-/// lines the call wrote (VER-84, see `tool_claims`).
+/// `state_dir` holds the Bash tool's stat snapshot between a call's pre and
+/// post hooks (the daemon that normally holds it never runs here), so files
+/// an agent changes through shell commands are credited to it. Each call's
+/// baseline (VER-84) lives under the repo's `.git/ai/`, as on the daemon path.
 pub fn checkpoint_from_hook(
     preset: &str,
     hook_input: &str,
@@ -45,72 +40,12 @@ pub fn checkpoint_from_hook(
     crate::commands::checkpoint_agent::bash_tool::enable_embedded_bash_sessions(
         state_dir.to_path_buf(),
     );
-    let trace_id = generate_trace_id();
-    let events = resolve_preset(preset)?.parse(hook_input, &trace_id)?;
-    let data: serde_json::Value = serde_json::from_str(hook_input).unwrap_or_default();
-
-    let mut applied = 0;
-    for event in events {
-        let call = ToolCall::of(&event);
-        let claim = match &call {
-            Some(call) if !call.is_pre => Some(ToolClaim {
-                written: if call.is_bash {
-                    None
-                } else {
-                    tool_claims::written_text(preset, &data)
-                },
-                baseline: tool_claims::take_baseline(
-                    state_dir,
-                    &call.session_id,
-                    &call.tool_use_id,
-                ),
-            }),
-            _ => None,
-        };
-        for request in execute_event(event, preset)? {
-            crate::daemon::apply_checkpoint_side_effect_with_claim(request, claim.as_ref())?;
-            applied += 1;
-        }
-        if let Some(call) = call.filter(|call| call.is_pre)
-            && let Err(error) = tool_claims::record_baseline(
-                state_dir,
-                &call.session_id,
-                &call.tool_use_id,
-                &call.cwd,
-            )
-        {
-            tracing::debug!("agent git: no baseline for {}: {}", call.tool_use_id, error);
-        }
+    let requests = execute_preset_checkpoint(preset, hook_input)?;
+    let applied = requests.len();
+    for request in requests {
+        crate::daemon::apply_checkpoint_side_effect(request)?;
     }
     Ok(applied)
-}
-
-/// The tool call a hook event belongs to.
-struct ToolCall {
-    session_id: String,
-    tool_use_id: String,
-    cwd: std::path::PathBuf,
-    is_pre: bool,
-    is_bash: bool,
-}
-
-impl ToolCall {
-    fn of(event: &ParsedHookEvent) -> Option<Self> {
-        let (context, tool_use_id, is_pre, is_bash) = match event {
-            ParsedHookEvent::PreFileEdit(e) => (&e.context, e.tool_use_id.clone()?, true, false),
-            ParsedHookEvent::PostFileEdit(e) => (&e.context, e.tool_use_id.clone()?, false, false),
-            ParsedHookEvent::PreBashCall(e) => (&e.context, e.tool_use_id.clone(), true, true),
-            ParsedHookEvent::PostBashCall(e) => (&e.context, e.tool_use_id.clone(), false, true),
-            ParsedHookEvent::KnownHumanEdit(_) | ParsedHookEvent::UntrackedEdit(_) => return None,
-        };
-        Some(Self {
-            session_id: context.external_session_id.clone(),
-            tool_use_id,
-            cwd: context.cwd.clone(),
-            is_pre,
-            is_bash,
-        })
-    }
 }
 
 #[cfg(test)]

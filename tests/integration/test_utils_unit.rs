@@ -38,6 +38,7 @@ fn build_scoped_human_checkpoint_request(
         path_role: PreparedPathRole::WillEdit,
         stream_source: None,
         metadata: HashMap::new(),
+        tool_call: None,
     }
 }
 
@@ -150,6 +151,7 @@ fn test_apply_default_checkpoint_scope_preserves_existing_explicit_scope() {
         path_role: PreparedPathRole::WillEdit,
         stream_source: None,
         metadata: HashMap::new(),
+        tool_call: None,
     };
 
     let applied = apply_default_checkpoint_scope(

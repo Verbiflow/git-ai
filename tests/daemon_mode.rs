@@ -1687,6 +1687,7 @@ fn daemon_stalled_unidentified_trace_connection_does_not_block_checkpoint_contro
         path_role: PreparedPathRole::Edited,
         stream_source: None,
         metadata: Default::default(),
+        tool_call: None,
     };
 
     let response =
@@ -1735,6 +1736,7 @@ fn daemon_checkpoint_resolution_applies_total_content_budget() {
         path_role: PreparedPathRole::Edited,
         stream_source: None,
         metadata: Default::default(),
+        tool_call: None,
     };
 
     let response =
@@ -1883,6 +1885,7 @@ fn daemon_checkpoint_ack_preserves_order_with_immediate_commit() {
         path_role: PreparedPathRole::Edited,
         stream_source: None,
         metadata: Default::default(),
+        tool_call: None,
     };
 
     let started = std::time::Instant::now();
@@ -1960,6 +1963,7 @@ fn daemon_soft_shutdown_drains_acknowledged_checkpoints() {
         path_role: PreparedPathRole::Edited,
         stream_source: None,
         metadata: Default::default(),
+        tool_call: None,
     };
 
     fs::write(repo.path().join("first.txt"), "first\n").unwrap();
@@ -2070,6 +2074,7 @@ fn daemon_drains_independent_checkpoint_families_concurrently() {
         path_role: PreparedPathRole::Edited,
         stream_source: None,
         metadata: Default::default(),
+        tool_call: None,
     };
 
     fs::write(
@@ -2167,6 +2172,7 @@ fn family_side_effect_grind_does_not_stall_independent_checkpoint_admission() {
         path_role: PreparedPathRole::Edited,
         stream_source: None,
         metadata: Default::default(),
+        tool_call: None,
     };
     let response =
         send_checkpoint_request_with_timeout(&control_socket, &checkpoint, Duration::from_secs(2))
@@ -2236,6 +2242,7 @@ fn checkpoint_admission_proceeds_while_same_family_side_effects_grind() {
         path_role: PreparedPathRole::Edited,
         stream_source: None,
         metadata: Default::default(),
+        tool_call: None,
     };
     let response = send_checkpoint_request_with_timeout(
         &daemon_control_socket_path(&repo),
@@ -2492,6 +2499,7 @@ fn delayed_checkpoint_admission_is_logged() {
         path_role: PreparedPathRole::Edited,
         stream_source: None,
         metadata: Default::default(),
+        tool_call: None,
     };
     let response = send_checkpoint_request_with_timeout(
         &daemon_control_socket_path(&repo),
@@ -2538,6 +2546,7 @@ fn daemon_checkpoint_processing_failure_is_logged_after_receipt_ack() {
         path_role: PreparedPathRole::Edited,
         stream_source: None,
         metadata: Default::default(),
+        tool_call: None,
     };
 
     let receipt = send_checkpoint_request_with_timeout(
@@ -2626,6 +2635,7 @@ fn daemon_async_checkpoint_receipts_preserve_file_edit_order_before_commit() {
         path_role: PreparedPathRole::WillEdit,
         stream_source: None,
         metadata: Default::default(),
+        tool_call: None,
     };
     let pre_receipt = send_checkpoint_request_with_timeout(
         &control_socket,
@@ -2659,6 +2669,7 @@ fn daemon_async_checkpoint_receipts_preserve_file_edit_order_before_commit() {
         path_role: PreparedPathRole::Edited,
         stream_source: None,
         metadata: Default::default(),
+        tool_call: None,
     };
     let post_receipt = send_checkpoint_request_with_timeout(
         &control_socket,
@@ -2783,6 +2794,7 @@ fn daemon_checkpoint_initial_base_does_not_fall_back_to_processing_time_head() {
         path_role: PreparedPathRole::Edited,
         stream_source: None,
         metadata: Default::default(),
+        tool_call: None,
     };
 
     let response =
@@ -3119,6 +3131,7 @@ fn daemon_partial_trace_line_does_not_block_checkpoint_control_request() {
         path_role: PreparedPathRole::Edited,
         stream_source: None,
         metadata: Default::default(),
+        tool_call: None,
     };
 
     let response =
@@ -6362,6 +6375,7 @@ fn daemon_memory_threshold_logs_uploads_and_aborts_without_draining() {
         path_role: PreparedPathRole::Edited,
         stream_source: None,
         metadata: Default::default(),
+        tool_call: None,
     };
     let checkpoint_response = send_checkpoint_request_with_timeout(
         &daemon.control_socket_path,

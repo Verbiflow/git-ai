@@ -39,6 +39,11 @@ pub struct CheckpointRequest {
     pub path_role: PreparedPathRole,
     pub stream_source: Option<StreamSource>,
     pub metadata: HashMap<String, String>,
+    /// The agent tool call this checkpoint belongs to (VER-84): a pre hook's
+    /// records a baseline, a post hook's scopes the checkpoint to what the call
+    /// wrote. See `tool_claims`.
+    #[serde(default)]
+    pub tool_call: Option<crate::commands::checkpoint_agent::tool_claims::ToolCallMarker>,
 }
 
 #[derive(Serialize)]
@@ -203,11 +208,36 @@ pub fn execute_preset_checkpoint(
         );
     }
 
+    let hook_data: serde_json::Value = serde_json::from_str(hook_input).unwrap_or_default();
     let mut requests = Vec::new();
     for event in events {
         let t_event = std::time::Instant::now();
         let event_name = format!("{:?}", std::mem::discriminant(&event));
-        let new_requests = execute_event(event, preset_name)?;
+        let marker =
+            crate::commands::checkpoint_agent::tool_claims::ToolCallMarker::for_event(
+                &event,
+                preset_name,
+                &hook_data,
+            );
+        let mut new_requests = execute_event(event, preset_name)?;
+        if let Some(marker) = marker {
+            if new_requests.is_empty() && marker.is_pre {
+                // Nothing to checkpoint, but the call still needs its baseline.
+                new_requests.push(CheckpointRequest {
+                    trace_id: trace_id.clone(),
+                    checkpoint_kind: CheckpointKind::Human,
+                    agent_id: None,
+                    files: Vec::new(),
+                    path_role: PreparedPathRole::WillEdit,
+                    stream_source: None,
+                    metadata: HashMap::new(),
+                    tool_call: None,
+                });
+            }
+            for request in &mut new_requests {
+                request.tool_call = Some(marker.clone());
+            }
+        }
         if perf {
             eprintln!(
                 "[perf] orchestrator: execute_event({})={:.1}ms (requests={})",
@@ -340,6 +370,7 @@ fn split_files_into_requests(
             path_role,
             stream_source: stream_source.clone(),
             metadata: metadata.clone(),
+            tool_call: None,
         })
         .collect()
 }

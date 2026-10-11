@@ -8,10 +8,11 @@
 //! * B's pre hook runs between A's write and A's post hook, so B's checkpoint
 //!   files A's lines as "human", and A's checkpoint then finds nothing changed.
 //!
-//! Each tool call therefore records a baseline at its pre hook (which content
-//! every file had, as working-log blobs), and its post hook carries a
-//! [`ToolClaim`]: the text the call wrote, from its own payload, plus that
-//! baseline. The post checkpoint then
+//! Each hook's checkpoint request therefore carries a [`ToolCallMarker`]. The
+//! pre hook's marker records a baseline once its checkpoint is applied (which
+//! content every file had, as working-log blobs, under `.git/ai/`), and the
+//! post hook's marker becomes a [`ToolClaim`]: the text the call wrote, from
+//! its own payload, plus that baseline. The post checkpoint then
 //!
 //! 1. gives back to "human" any line it took that the call's text does not
 //!    contain, so a concurrent writer's lines are not taken, and
@@ -28,7 +29,9 @@ use crate::authorship::attribution_tracker::{
 };
 use crate::authorship::imara_diff_utils::{LineChangeTag, compute_line_changes};
 use crate::authorship::working_log::CheckpointKind;
+use crate::commands::checkpoint_agent::presets::ParsedHookEvent;
 use crate::error::GitAiError;
+use crate::git::repository::Repository;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -65,22 +68,74 @@ pub struct Baseline {
     pub blobs: HashMap<String, String>,
 }
 
-fn baseline_path(dir: &Path, session_id: &str, tool_use_id: &str) -> PathBuf {
-    use sha2::{Digest, Sha256};
-    let key = Sha256::digest(format!("{session_id}\0{tool_use_id}").as_bytes());
-    dir.join("tool-baselines").join(format!("{key:x}.json"))
+/// Which tool call a hook's checkpoint request belongs to, and which side of
+/// it the hook fired on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolCallMarker {
+    pub is_pre: bool,
+    pub session_id: String,
+    pub tool_use_id: String,
+    /// The repo the call runs in; a pre hook with nothing to checkpoint still
+    /// records its baseline here.
+    pub repo_work_dir: PathBuf,
+    /// Post hooks of file edits: the text the call wrote (see
+    /// [`written_text`]). `None` for shell commands and pre hooks.
+    #[serde(default)]
+    pub written: Option<Vec<String>>,
 }
 
-/// Record, at a pre hook, which content every file of the repo at `cwd` has.
-/// Called after the pre hook's own checkpoint, so files it just checkpointed
-/// are in the baseline at their current content.
+impl ToolCallMarker {
+    /// The marker for `event`, or `None` for events outside a tool call (or
+    /// outside a repo). `data` is the hook payload, for the written text.
+    pub fn for_event(
+        event: &ParsedHookEvent,
+        preset: &str,
+        data: &serde_json::Value,
+    ) -> Option<Self> {
+        let (context, tool_use_id, is_pre, is_bash) = match event {
+            ParsedHookEvent::PreFileEdit(e) => (&e.context, e.tool_use_id.clone()?, true, false),
+            ParsedHookEvent::PostFileEdit(e) => {
+                (&e.context, e.tool_use_id.clone()?, false, false)
+            }
+            ParsedHookEvent::PreBashCall(e) => (&e.context, e.tool_use_id.clone(), true, true),
+            ParsedHookEvent::PostBashCall(e) => (&e.context, e.tool_use_id.clone(), false, true),
+            ParsedHookEvent::KnownHumanEdit(_) | ParsedHookEvent::UntrackedEdit(_) => return None,
+        };
+        let repo_work_dir =
+            crate::git::repository::discover_repository_in_path_no_git_exec(&context.cwd)
+                .and_then(|repo| repo.workdir())
+                .ok()?;
+        Some(Self {
+            is_pre,
+            session_id: context.external_session_id.clone(),
+            tool_use_id,
+            repo_work_dir,
+            written: if is_pre || is_bash {
+                None
+            } else {
+                written_text(preset, data)
+            },
+        })
+    }
+}
+
+fn baseline_path(repo: &Repository, session_id: &str, tool_use_id: &str) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    let key = Sha256::digest(format!("{session_id}\0{tool_use_id}").as_bytes());
+    repo.storage
+        .ai_dir
+        .join("tool-baselines")
+        .join(format!("{key:x}.json"))
+}
+
+/// Record, at a pre hook, which content every file of `repo` has. Called
+/// after the pre hook's own checkpoint, so files it just checkpointed are in
+/// the baseline at their current content.
 pub fn record_baseline(
-    dir: &Path,
+    repo: &Repository,
     session_id: &str,
     tool_use_id: &str,
-    cwd: &Path,
 ) -> Result<(), GitAiError> {
-    let repo = crate::git::repository::discover_repository_in_path_no_git_exec(cwd)?;
     let workdir = repo.workdir()?;
     let base_commit = crate::git::repo_state::read_head_state_for_worktree(&workdir)
         .and_then(|state| state.head)
@@ -96,7 +151,7 @@ pub fn record_baseline(
         }
     }
 
-    let path = baseline_path(dir, session_id, tool_use_id);
+    let path = baseline_path(repo, session_id, tool_use_id);
     let Some(parent) = path.parent() else {
         return Ok(());
     };
@@ -111,8 +166,8 @@ pub fn record_baseline(
 }
 
 /// Read and remove the baseline a pre hook recorded for this tool call.
-pub fn take_baseline(dir: &Path, session_id: &str, tool_use_id: &str) -> Option<Baseline> {
-    let path = baseline_path(dir, session_id, tool_use_id);
+pub fn take_baseline(repo: &Repository, session_id: &str, tool_use_id: &str) -> Option<Baseline> {
+    let path = baseline_path(repo, session_id, tool_use_id);
     let bytes = fs::read(&path).ok()?;
     let _ = fs::remove_file(&path);
     serde_json::from_slice(&bytes).ok()
