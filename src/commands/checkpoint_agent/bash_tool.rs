@@ -268,7 +268,7 @@ impl StatEntry {
 /// A complete filesystem snapshot: stat-tuples keyed by normalized path.
 ///
 /// Only stores entries for files that pass the git-ai ignore filter AND have
-/// `mtime > effective_worktree_wm + GRACE` (i.e., not covered by any watermark).
+/// `mtime > effective_worktree_wm` (i.e., not covered by any watermark).
 /// Filtering is applied uniformly to all files — there is no special treatment
 /// for git-tracked vs untracked files.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -516,23 +516,28 @@ pub fn git_index_mtime_ns(repo_root: &Path) -> Option<u128> {
 }
 
 /// Test whether a file is covered by the current watermarks, meaning it has
-/// not been modified since the last known-good baseline and does not need to
-/// be stored in the snapshot.
+/// not been modified since the last known-good baseline.
 ///
 /// A file is covered when:
-/// - It has a per-file watermark AND `mtime ≤ file_wm + GRACE`, OR
+/// - It has a per-file watermark AND `mtime ≤ file_wm + grace`, OR
 /// - No per-file watermark but an effective worktree wm exists AND
-///   `mtime ≤ effective_wm + GRACE`.
+///   `mtime ≤ effective_wm + grace`.
+///
+/// The snapshot passes a zero grace: a file inside the grace window must stay
+/// in both snapshots so the stat diff can see a bash rewrite that lands right
+/// after an agent edit (rustfmt straight after Edit). Only the pre-hook's
+/// dirty-path list applies `MTIME_GRACE_WINDOW_NS`.
 fn is_wm_covered(
     mtime_ns: u128,
     effective_wm: Option<u128>,
     per_file_wm: &HashMap<String, u128>,
     posix_key: &str,
+    grace_ns: u128,
 ) -> bool {
     if let Some(&file_wm) = per_file_wm.get(posix_key) {
-        return mtime_ns <= file_wm + MTIME_GRACE_WINDOW_NS;
+        return mtime_ns <= file_wm + grace_ns;
     }
-    effective_wm.is_some_and(|ewm| mtime_ns <= ewm + MTIME_GRACE_WINDOW_NS)
+    effective_wm.is_some_and(|ewm| mtime_ns <= ewm + grace_ns)
 }
 
 // ---------------------------------------------------------------------------
@@ -586,7 +591,7 @@ pub fn should_include_new_file(gitignore: &Gitignore, path: &Path, is_dir: bool)
 /// Take a stat snapshot of the repo working tree.
 ///
 /// Only stores entries for files that pass the git-ai ignore filter (gitignore
-/// + defaults + .git-ai-ignore + linguist) AND have `mtime > effective_wm + GRACE`.
+/// + defaults + .git-ai-ignore + linguist) AND have `mtime > effective_wm`.
 ///
 /// Filtering is applied uniformly to all files — there is no special treatment
 /// for git-tracked vs untracked files.
@@ -717,7 +722,7 @@ pub fn snapshot(
                 let stat = StatEntry::from_metadata(&meta);
                 let mtime_ns = stat.mtime.map(system_time_to_nanos).unwrap_or(0);
                 let posix_key = normalize_to_posix(&normalized.to_string_lossy());
-                if !is_wm_covered(mtime_ns, effective_worktree_wm, &per_file_wm, &posix_key) {
+                if !is_wm_covered(mtime_ns, effective_worktree_wm, &per_file_wm, &posix_key, 0) {
                     entries.insert(normalized, stat);
                     if entries.len() > MAX_TRACKED_FILES {
                         tracing::debug!(
@@ -1158,7 +1163,21 @@ pub fn handle_bash_pre_tool_use_with_context_and_cwd(
             Err(_) => vec![],
         }
     } else {
-        snap.entries.keys().map(|rel| repo_root.join(rel)).collect()
+        snap.entries
+            .iter()
+            .filter(|(rel, stat)| {
+                let mtime_ns = stat.mtime.map(system_time_to_nanos).unwrap_or(0);
+                let posix_key = normalize_to_posix(&rel.to_string_lossy());
+                !is_wm_covered(
+                    mtime_ns,
+                    snap.effective_worktree_wm,
+                    &snap.per_file_wm,
+                    &posix_key,
+                    MTIME_GRACE_WINDOW_NS,
+                )
+            })
+            .map(|(rel, _)| repo_root.join(rel))
+            .collect()
     };
 
     if let Some(dir) = EMBEDDED_BASH_SESSIONS_DIR.get() {
@@ -1537,6 +1556,42 @@ mod tests {
         let result = diff(&pre, &post);
         assert!(result.created.is_empty());
         assert_eq!(result.modified.len(), 1);
+    }
+
+    #[test]
+    fn test_bash_rewrite_right_after_agent_edit_is_detected() {
+        // An agent Edit is checkpointed (per-file watermark = the file's mtime),
+        // then bash runs rustfmt on it well inside the 2s grace window.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("settings.rs");
+        fs::write(&file, "fn a() { b() }\n").unwrap();
+        let checkpointed_ns =
+            system_time_to_nanos(fs::metadata(&file).unwrap().modified().unwrap());
+        let wm = DaemonWatermarks {
+            per_file: HashMap::from([("settings.rs".to_string(), checkpointed_ns)]),
+            worktree: None,
+        };
+
+        let pre = snapshot(dir.path(), "s", "t", Some(&wm)).unwrap();
+        assert!(
+            pre.entries.is_empty(),
+            "untouched checkpointed file is covered"
+        );
+
+        std::thread::sleep(Duration::from_millis(20));
+        fs::write(&file, "fn a() {\n    b()\n}\n").unwrap();
+        let rewritten_ns = system_time_to_nanos(fs::metadata(&file).unwrap().modified().unwrap());
+        // The production grace window would have hidden this rewrite.
+        assert!(is_wm_covered(
+            rewritten_ns,
+            None,
+            &wm.per_file,
+            "settings.rs",
+            2_000_000_000,
+        ));
+
+        let post = snapshot(dir.path(), "s", "t", Some(&wm)).unwrap();
+        assert_eq!(diff(&pre, &post).all_changed_paths(), vec!["settings.rs"]);
     }
 
     #[test]
