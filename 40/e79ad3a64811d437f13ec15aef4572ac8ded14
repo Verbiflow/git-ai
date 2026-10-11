@@ -1,0 +1,19 @@
+src/commands/checkpoint_agent/bash_tool.rs
+  s_40549a853e32b5::t_1e5eb085187629 271,519,522,524-529,535,538,540,594,725,1166-1180,1562-1597
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "40e79ad3a64811d437f13ec15aef4572ac8ded14",
+  "prompts": {},
+  "sessions": {
+    "s_40549a853e32b5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9d612a34-51dd-4a79-8816-0cc01ac70a5c",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Rishi Mahadevan <rishimahadevan@gmail.com>"
+    }
+  }
+}
